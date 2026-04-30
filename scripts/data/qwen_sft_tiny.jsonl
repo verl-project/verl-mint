@@ -1,0 +1,2 @@
+{"instruction":"Repeat the input tokens as output.","input":"1 2 3","output":"1 2 3"}
+{"instruction":"Map lowercase to uppercase words.","input":"hello world","output":"HELLO WORLD"}

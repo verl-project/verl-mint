@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+*.pyc
+
+# Local checkpoint scratch space from review and storage-path validation.
+/local-nonshared-storage/
