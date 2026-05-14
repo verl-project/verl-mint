@@ -20,6 +20,7 @@ from verl_mint.contracts import (
     TrainingCapabilities,
     TrainState,
 )
+from verl_mint.model_registry import get_model_config
 from verl_mint.errors import UnsupportedOperationError
 from verl_mint.milestone1 import MILESTONE1_BASE_MODEL_ID, MILESTONE1_MODEL_PATH_ENV
 from verl_mint.storage import LocalStorageRepo
@@ -238,6 +239,15 @@ class QwenSFTTrainingBackend(TrainingBackend):
     def open_session(self, spec: SessionSpec) -> SessionHandle:
         metadata = dict(spec.metadata)
         base_model = str(metadata.get("base_model") or self.model_id)
+        try:
+            cfg = get_model_config(base_model)
+        except ValueError:
+            cfg = None
+        if cfg is not None and cfg.is_moe:
+            raise RuntimeError(
+                f"{base_model} is a MoE model and requires the TP={cfg.train_tp} Megatron training backend; "
+                "QwenSFTTrainingBackend is single-process and must not host 30B MoE training"
+            )
         model_ref = _resolve_model_ref(base_model)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -694,14 +704,14 @@ class QwenSFTTrainingBackend(TrainingBackend):
         return self.sessions[handle.backend_session_id]
 
     def _artifact_path_for_write(self, uri: str) -> Path:
-        if uri.startswith(("mint://", "tinker://", "repo://")):
+        if uri.startswith(("mint://", "repo://")):
             return Path(LocalStorageRepo.from_env().resolve_for_write(uri))
         path = Path(uri).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     def _artifact_path_for_read(self, uri: str) -> Path:
-        if uri.startswith(("mint://", "tinker://", "repo://")):
+        if uri.startswith(("mint://", "repo://")):
             return Path(LocalStorageRepo.from_env().resolve_for_read(uri))
         return Path(uri).expanduser()
 
@@ -1098,7 +1108,7 @@ class QwenSFTTrainingBackend(TrainingBackend):
 
 
 def _resolve_artifact_reference(uri: str) -> str:
-    if uri.startswith(("mint://", "tinker://", "repo://")):
+    if uri.startswith(("mint://", "repo://")):
         return LocalStorageRepo.from_env().resolve_for_read(uri)
     if uri.startswith("file://"):
         return str(Path(uri[len("file://") :]).expanduser().resolve())

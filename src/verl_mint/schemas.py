@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MintBaseSchema(BaseModel):
@@ -145,7 +145,7 @@ class FutureRetrieveRequest(MintBaseSchema):
 
 
 class WeightsInfoRequest(MintBaseSchema):
-    mint_path: str = Field(validation_alias=AliasChoices("mint_path", "tinker_path"))
+    mint_path: str
 
 
 class CreateModelRequest(MintBaseSchema):

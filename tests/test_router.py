@@ -36,8 +36,12 @@ from verl_mint.storage import (
     LocalStorageRepo,
     default_storage_root,
     shared_storage_env_name,
+    shared_storage_roots_env_name,
     storage_env_name,
 )
+
+
+QWEN30B_MODEL_ID = "Qwen/Qwen3-30B-A3B-Base"
 
 
 class FakeInferenceBackend(InferenceBackend):
@@ -341,7 +345,7 @@ def test_verl_reverse_kl_preserves_portable_reference_uri(tmp_path, monkeypatch)
 
     monkeypatch.setenv(shared_storage_env_name(), "1")
     backend = RecordingTrainingBackend()
-    shared_root = Path(tempfile.mkdtemp(prefix="verl-mint-shared-", dir="/vePFS-Mindverse/share"))
+    shared_root = tmp_path / "shared"
     service = MintService(storage=LocalStorageRepo(shared_root))
     service.backends.register(
         BackendSpec(
@@ -396,8 +400,9 @@ def test_verl_reverse_kl_rejects_nonshared_absolute_reference_path(tmp_path) -> 
         )
 
 
-def test_verl_rollout_reference_path_rejects_nonshared_absolute_override() -> None:
-    shared_root = Path(tempfile.mkdtemp(prefix="verl-mint-shared-", dir="/vePFS-Mindverse/share"))
+def test_verl_rollout_reference_path_rejects_nonshared_absolute_override(tmp_path, monkeypatch) -> None:
+    shared_root = tmp_path / "shared"
+    monkeypatch.setenv(shared_storage_roots_env_name(), str(shared_root))
     service = MintService(storage=LocalStorageRepo(shared_root))
     service.backends.register(
         BackendSpec(
@@ -429,16 +434,18 @@ def test_verl_rollout_reference_path_rejects_nonshared_absolute_override() -> No
             "roll-ray",
             prompt="1 2",
             batch_codec="torch",
-            metadata={"reference_model_path": "/root/not-shared/ref.pt"},
+            metadata={"reference_model_path": str(tmp_path / "not-shared" / "ref.pt")},
         )
 
 
-def test_mint_service_does_not_leave_shared_flag_sticky(monkeypatch) -> None:
+def test_mint_service_does_not_leave_shared_flag_sticky(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv(shared_storage_env_name(), raising=False)
-    shared_root = Path(tempfile.mkdtemp(prefix="verl-mint-shared-", dir="/vePFS-Mindverse/share"))
+    shared_root = tmp_path / "shared"
+    monkeypatch.setenv(shared_storage_roots_env_name(), str(shared_root))
     MintService(storage=LocalStorageRepo(shared_root))
+    monkeypatch.delenv(shared_storage_roots_env_name(), raising=False)
 
-    local_root = Path(tempfile.mkdtemp(prefix="verl-mint-local-", dir="/root"))
+    local_root = tmp_path / "local"
     service = MintService(storage=LocalStorageRepo(local_root))
     service.backends.register(
         BackendSpec(
@@ -467,7 +474,7 @@ def test_group_advantages_preserves_singleton_reward_signal() -> None:
 
 
 def test_qwen_ppo_allows_missing_old_logprobs() -> None:
-    import torch
+    torch = pytest.importorskip("torch")
 
     from verl_mint.backends.qwen_sft import QwenSFTTrainingBackend, _PolicyTrace
 
@@ -545,7 +552,7 @@ def _qwen_dpo_payload(*, include_reference: bool = True) -> dict:
 
 
 def _qwen_dpo_backend():
-    import torch
+    torch = pytest.importorskip("torch")
 
     from verl_mint.backends.qwen_sft import QwenSFTTrainingBackend, _PolicyTrace
 
@@ -924,10 +931,12 @@ def test_fastapi_returns_mint_like_response_skeletons(tmp_path) -> None:
     server_info_v1 = client.get("/api/v1/server_info")
     assert server_info_v1.status_code == 200
     assert server_info_v1.json()["server"] == "verl-mint"
+    assert "storage_root" not in server_info_v1.json()
 
     server_info_legacy = client.get("/server_info")
     assert server_info_legacy.status_code == 200
     assert server_info_legacy.json()["server"] == "verl-mint"
+    assert "storage_root" not in server_info_legacy.json()
 
     create_resp = client.post(
         "/create_model",
@@ -1550,9 +1559,7 @@ def test_fastapi_returns_mint_like_response_skeletons(tmp_path) -> None:
     assert "sess:2" not in remaining_ids
 
 
-def test_versioned_save_uses_tinker_paths_and_weights_info_aliases(tmp_path) -> None:
-    import tinker.types as tinker_types
-
+def test_versioned_save_uses_mint_paths_and_weights_info_aliases(tmp_path) -> None:
     service = MintService(storage=LocalStorageRepo(tmp_path))
     service.backends.register(
         BackendSpec(
@@ -1581,8 +1588,6 @@ def test_versioned_save_uses_tinker_paths_and_weights_info_aliases(tmp_path) -> 
     save_payload = client.post("/api/v1/retrieve_future", json=save_resp.json()).json()
     assert save_payload["path"] == "mint://sess:1/weights/checkpoint-001"
 
-    weights_info_tinker = client.post("/api/v1/weights_info", json={"tinker_path": save_payload["path"]})
-    assert weights_info_tinker.status_code == 200
     weights_info_mint = client.post("/api/v1/weights_info", json={"mint_path": "mint://sess:1/weights/checkpoint-001"})
     assert weights_info_mint.status_code == 200
     weights_info_legacy = client.post("/weights_info", json={"mint_path": "mint://sess:1/weights/checkpoint-001"})
@@ -1590,24 +1595,31 @@ def test_versioned_save_uses_tinker_paths_and_weights_info_aliases(tmp_path) -> 
 
     training_runs_resp = client.get("/api/v1/training_runs")
     assert training_runs_resp.status_code == 200
-    tinker_types.TrainingRunsResponse.model_validate(training_runs_resp.json())
+    training_runs_payload = training_runs_resp.json()
+    assert training_runs_payload["object"] == "list"
+    assert training_runs_payload["data"][0]["id"] == "sess:1"
+    assert training_runs_payload["data"][0]["model"] == "llama"
 
     training_run_resp = client.get("/api/v1/training_runs/sess:1")
     assert training_run_resp.status_code == 200
-    tinker_types.TrainingRun.model_validate(training_run_resp.json())
+    training_run_payload = training_run_resp.json()
+    assert training_run_payload["id"] == "sess:1"
+    assert training_run_payload["model"] == "llama"
+    assert training_run_payload["last_checkpoint"]["path"] == "mint://sess:1/weights/checkpoint-001"
 
     checkpoints_resp = client.get("/api/v1/training_runs/sess:1/checkpoints")
     assert checkpoints_resp.status_code == 200
     checkpoints_payload = checkpoints_resp.json()
-    tinker_types.CheckpointsListResponse.model_validate(checkpoints_payload)
+    assert checkpoints_payload["object"] == "list"
+    assert checkpoints_payload["data"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
 
     all_checkpoints_resp = client.get("/api/v1/checkpoints")
     assert all_checkpoints_resp.status_code == 200
-    tinker_types.CheckpointsListResponse.model_validate(all_checkpoints_resp.json())
+    assert all_checkpoints_resp.json()["data"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
 
     all_checkpoints_legacy_resp = client.get("/checkpoints")
     assert all_checkpoints_legacy_resp.status_code == 200
-    tinker_types.CheckpointsListResponse.model_validate(all_checkpoints_legacy_resp.json())
+    assert all_checkpoints_legacy_resp.json()["checkpoints"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
 
     paged_v1 = client.get("/api/v1/checkpoints?offset=0&limit=1")
     assert paged_v1.status_code == 200
@@ -1624,7 +1636,9 @@ def test_versioned_save_uses_tinker_paths_and_weights_info_aliases(tmp_path) -> 
     checkpoint_id = checkpoints_payload["checkpoints"][0]["checkpoint_id"]
     checkpoint_detail_resp = client.get(f"/api/v1/training_runs/sess:1/checkpoints/{checkpoint_id}")
     assert checkpoint_detail_resp.status_code == 200
-    tinker_types.Checkpoint.model_validate(checkpoint_detail_resp.json())
+    checkpoint_detail_payload = checkpoint_detail_resp.json()
+    assert checkpoint_detail_payload["checkpoint_id"] == checkpoint_id
+    assert checkpoint_detail_payload["path"] == "mint://sess:1/weights/checkpoint-001"
 
     archive_resp = client.get(
         f"/api/v1/training_runs/sess:1/checkpoints/{checkpoint_id}/archive",
@@ -1637,7 +1651,7 @@ def test_versioned_save_uses_tinker_paths_and_weights_info_aliases(tmp_path) -> 
 
     delete_resp = client.delete(f"/api/v1/training_runs/sess:1/checkpoints/{checkpoint_id}")
     assert delete_resp.status_code == 204
-    deleted_weights_info = client.post("/api/v1/weights_info", json={"tinker_path": save_payload["path"]})
+    deleted_weights_info = client.post("/api/v1/weights_info", json={"mint_path": save_payload["path"]})
     assert deleted_weights_info.status_code == 404
 
 
@@ -1777,7 +1791,7 @@ def test_sampling_endpoints_require_existing_sampler_artifact(tmp_path) -> None:
     app.state.sampling_sessions["sess:sampler:1"] = {
         "session_id": "sess",
         "base_model": "llama",
-        "model_path": "tinker://sess/weights/missing.pt",
+        "model_path": "mint://sess/weights/missing.pt",
         "lora_rank": 32,
     }
     client = TestClient(app)
@@ -2059,3 +2073,70 @@ def test_terminal_close_blocks_future_ops(tmp_path) -> None:
     assert service.training.get_model("model-close").status == "close_failed"
     with pytest.raises(UnsupportedOperationError, match="not active"):
         service.training.train_step("model-close", batch_payload={})
+
+
+def test_create_model_routes_qwen30b_moe_to_megatron_backend(tmp_path) -> None:
+    model = QWEN30B_MODEL_ID
+    service = MintService(storage=LocalStorageRepo(tmp_path))
+    service.backends.register(
+        BackendSpec(
+            backend_id="qwen-local",
+            kind=BackendKind.TRAINING,
+            provider="transformers",
+            model_family="qwen",
+        ),
+        FakeTrainingBackend(),
+    )
+    service.backends.register(
+        BackendSpec(
+            backend_id="qwen-megatron",
+            kind=BackendKind.TRAINING,
+            provider="megatron",
+            model_family="qwen",
+        ),
+        FakeTrainingBackend(),
+    )
+    app = create_app(service)
+    client = TestClient(app)
+
+    create_resp = client.post(
+        "/create_model",
+        json={
+            "session_id": "qwen30b",
+            "model_seq_id": 1,
+            "base_model": model,
+            "batch_codec": "verl",
+        },
+    )
+    assert create_resp.status_code == 200
+    payload = client.post("/retrieve_future", json=create_resp.json()).json()
+    assert payload["backend"] == "qwen-megatron"
+    assert service.training.get_model("qwen30b:1").backend_id == "qwen-megatron"
+
+
+def test_create_model_rejects_qwen30b_without_megatron_backend(tmp_path) -> None:
+    model = QWEN30B_MODEL_ID
+    service = MintService(storage=LocalStorageRepo(tmp_path))
+    service.backends.register(
+        BackendSpec(
+            backend_id="qwen-local",
+            kind=BackendKind.TRAINING,
+            provider="transformers",
+            model_family="qwen",
+        ),
+        FakeTrainingBackend(),
+    )
+    app = create_app(service)
+    client = TestClient(app)
+
+    create_resp = client.post(
+        "/create_model",
+        json={
+            "session_id": "qwen30b",
+            "model_seq_id": 1,
+            "base_model": model,
+            "batch_codec": "torch",
+        },
+    )
+    assert create_resp.status_code == 400
+    assert "requires a Megatron training backend" in create_resp.json()["detail"]

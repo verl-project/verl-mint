@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from verl_mint.backends.base import InferenceBackend, TrainingBackend
+from verl_mint.backends.mint_style import MintStyleGRPOTrainer
 from verl_mint.contracts import (
     ArtifactRef,
     CheckpointRequest,
@@ -20,6 +21,7 @@ from verl_mint.contracts import (
     TrainingCapabilities,
     TrainState,
 )
+from verl_mint.model_registry import ModelConfig, get_model_config
 
 
 class VerlRuntimeError(RuntimeError):
@@ -83,6 +85,115 @@ def _nested_get(value: Any, path: str) -> Any:
     return current
 
 
+def _model_ref_from_spec(spec: Mapping[str, Any]) -> str | None:
+    for key in ("model_path", "model_id", "base_model"):
+        value = spec.get(key)
+        if isinstance(value, str) and value:
+            return value
+    hydra = spec.get("hydra")
+    if isinstance(hydra, Mapping):
+        for item in hydra.get("overrides") or []:
+            raw = str(item)
+            key, sep, value = raw.partition("=")
+            if sep and key.lstrip("+") == "actor_rollout_ref.model.path" and value:
+                return value
+    return None
+
+
+def _override_key(item: str) -> str:
+    return item.partition("=")[0].lstrip("+")
+
+
+def _merge_hydra_overrides(base: list[str], extra: list[str], *, replace: bool = False) -> list[str]:
+    merged = list(base)
+    index = {_override_key(item): i for i, item in enumerate(merged) if "=" in item}
+    for item in extra:
+        key = _override_key(item)
+        if replace and key in index:
+            merged[index[key]] = item
+        elif key not in index:
+            index[key] = len(merged)
+            merged.append(item)
+    return merged
+
+
+def _drop_hydra_overrides(base: list[str], prefixes: tuple[str, ...]) -> list[str]:
+    return [item for item in base if not _override_key(item).startswith(prefixes)]
+
+
+def _mint_hydra_overrides(model_ref: str, cfg: ModelConfig) -> list[str]:
+    values = [
+        f"actor_rollout_ref.model.path={model_ref}",
+        f"actor_rollout_ref.model.enable_gradient_checkpointing={str(cfg.gradient_checkpointing)}",
+        f"trainer.n_gpus_per_node={cfg.train_gpus}",
+        "trainer.nnodes=1",
+    ]
+    if cfg.is_moe:
+        etp = cfg.train_etp if cfg.train_etp is not None else cfg.train_tp
+        values.extend(
+            [
+                f"actor_rollout_ref.actor.megatron.tensor_model_parallel_size={cfg.train_tp}",
+                f"actor_rollout_ref.actor.megatron.pipeline_model_parallel_size={cfg.train_pp}",
+                f"actor_rollout_ref.actor.megatron.expert_model_parallel_size={cfg.train_ep}",
+                f"actor_rollout_ref.actor.megatron.context_parallel_size={cfg.train_cp}",
+                f"actor_rollout_ref.actor.megatron.expert_tensor_parallel_size={etp}",
+                "actor_rollout_ref.actor.megatron.param_offload=True",
+                "actor_rollout_ref.actor.megatron.optimizer_offload=True",
+                "actor_rollout_ref.actor.megatron.grad_offload=True",
+                "actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True",
+                "actor_rollout_ref.actor.checkpoint.save_contents=[model,optimizer,extra]",
+                "actor_rollout_ref.actor.checkpoint.load_contents=[model,optimizer,extra]",
+                "actor_rollout_ref.actor.megatron.use_mbridge=True",
+                "actor_rollout_ref.actor.megatron.vanilla_mbridge=False",
+                "+actor_rollout_ref.actor.megatron.override_ddp_config.grad_reduce_in_fp32=True",
+                "+actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform",
+                "+actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full",
+                "+actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1",
+                "+actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32",
+                f"actor_rollout_ref.ref.megatron.tensor_model_parallel_size={cfg.train_tp}",
+                f"actor_rollout_ref.ref.megatron.pipeline_model_parallel_size={cfg.train_pp}",
+                f"actor_rollout_ref.ref.megatron.expert_model_parallel_size={cfg.train_ep}",
+                f"actor_rollout_ref.ref.megatron.context_parallel_size={cfg.train_cp}",
+                f"actor_rollout_ref.ref.megatron.expert_tensor_parallel_size={etp}",
+                "actor_rollout_ref.ref.megatron.param_offload=True",
+                f"critic.megatron.tensor_model_parallel_size={cfg.train_tp}",
+                f"critic.megatron.pipeline_model_parallel_size={cfg.train_pp}",
+                f"critic.megatron.expert_model_parallel_size={cfg.train_ep}",
+                f"critic.megatron.context_parallel_size={cfg.train_cp}",
+                f"critic.megatron.expert_tensor_parallel_size={etp}",
+                "critic.megatron.param_offload=True",
+                "critic.megatron.optimizer_offload=True",
+                "critic.megatron.grad_offload=True",
+                "critic.optim.override_optimizer_config.use_precision_aware_optimizer=True",
+                "critic.checkpoint.save_contents=[model,optimizer,extra]",
+                "critic.checkpoint.load_contents=[model,optimizer,extra]",
+                f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg.inference_tp}",
+                f"actor_rollout_ref.rollout.data_parallel_size={cfg.inference_dp}",
+                f"actor_rollout_ref.rollout.max_model_len={cfg.max_model_len}",
+            ]
+        )
+        if cfg.train_lora_rank is not None:
+            values.extend(
+                [
+                    f"+actor_rollout_ref.model.lora.rank={cfg.train_lora_rank}",
+                    f"+actor_rollout_ref.model.lora.alpha={cfg.train_lora_alpha or cfg.train_lora_rank * 2}",
+                    "+actor_rollout_ref.model.lora.dtype=float16",
+                    "+actor_rollout_ref.model.lora.type=lora",
+                    "+actor_rollout_ref.model.lora.target_modules=[linear_qkv,linear_proj,linear_fc1,linear_fc2]",
+                    "+actor_rollout_ref.model.lora.exclude_modules=[]",
+                ]
+            )
+        if cfg.gpu_memory_utilization is not None:
+            values.append(f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg.gpu_memory_utilization}")
+        if cfg.max_num_seqs is not None:
+            values.append(f"actor_rollout_ref.rollout.max_num_seqs={cfg.max_num_seqs}")
+        if cfg.max_num_batched_tokens is not None:
+            values.append(f"actor_rollout_ref.rollout.max_num_batched_tokens={cfg.max_num_batched_tokens}")
+        if cfg.max_lora_rank is not None:
+            values.append(f"actor_rollout_ref.model.lora_rank={cfg.max_lora_rank}")
+    return values
+
+
 @dataclass(frozen=True)
 class VerlRuntimeConfig:
     model_id: str | None = None
@@ -90,15 +201,35 @@ class VerlRuntimeConfig:
     trainer: Mapping[str, Any] | None = None
     rollout: Mapping[str, Any] | None = None
     resources: Mapping[str, Any] | None = None
+    model_config: ModelConfig | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "VerlRuntimeConfig":
+        model_id = value.get("model_id")
+        model_path = value.get("model_path")
+        trainer = dict(value.get("trainer") or {})
+        rollout = dict(value.get("rollout") or {})
+        resources = dict(value.get("resources") or {})
+        model_config = value.get("model_config")
+        if model_config is not None and not isinstance(model_config, ModelConfig):
+            raise TypeError("model_config must be a ModelConfig")
+        if model_config is None:
+            model_ref = model_path or model_id
+            if isinstance(model_ref, str) and model_ref:
+                try:
+                    model_config = get_model_config(model_ref)
+                except ValueError:
+                    model_config = None
+        if isinstance(model_config, ModelConfig):
+            resources.setdefault("train_gpus", model_config.train_gpus)
+            resources.setdefault("inference_gpus", model_config.inference_gpus)
         return cls(
-            model_id=value.get("model_id"),
-            model_path=value.get("model_path"),
-            trainer=dict(value.get("trainer") or {}),
-            rollout=dict(value.get("rollout") or {}),
-            resources=dict(value.get("resources") or {}),
+            model_id=model_id,
+            model_path=model_path,
+            trainer=VerlPPOJobRunner._with_mint_model_overrides(trainer, fallback_model_ref=model_path or model_id),
+            rollout=rollout,
+            resources=resources,
+            model_config=model_config,
         )
 
     def merged(self, value: Mapping[str, Any]) -> "VerlRuntimeConfig":
@@ -108,13 +239,23 @@ class VerlRuntimeConfig:
             "trainer": dict(self.trainer or {}),
             "rollout": dict(self.rollout or {}),
             "resources": dict(self.resources or {}),
+            "model_config": self.model_config,
         }
         for k, v in value.items():
             if k in {"trainer", "rollout", "resources"} and isinstance(v, Mapping):
-                merged[k] = {**dict(merged[k] or {}), **dict(v)}
+                merged[k] = _merge_mapping(dict(merged[k] or {}), v)
+            elif k == "metadata" and isinstance(v, Mapping):
+                continue
             else:
                 merged[k] = v
+        if isinstance(value.get("base_model"), str):
+            merged["model_id"] = value["base_model"]
+            merged["model_path"] = value["base_model"]
         return VerlRuntimeConfig.from_mapping(merged)
+
+    @property
+    def model_ref(self) -> str | None:
+        return self.model_path or self.model_id
 
 
 class VerlBatchAdapter:
@@ -176,6 +317,7 @@ class VerlPPOJobRunner:
         run_ppo: Callable[[Any], Any] | None = None,
     ) -> None:
         self.config = dict(config or {})
+        self._apply_mint_model_config()
         self.run_ppo = None if self.config.get("remote_run_ppo") else run_ppo or self._resolve_run_ppo(self.config)
         self.initialized = False
         self.closed = False
@@ -259,7 +401,7 @@ class VerlPPOJobRunner:
         if not isinstance(meta_info, Mapping):
             raise TypeError("veRL PPO DataProto meta_info must be a mapping")
 
-        spec = dict(self.config)
+        spec = self._with_mint_model_overrides(dict(self.config))
         for key in ("ppo_config", "verl_config", "config"):
             value = meta_info.get(key)
             if isinstance(value, Mapping):
@@ -270,6 +412,46 @@ class VerlPPOJobRunner:
         if self.config.get("remote_run_ppo"):
             return spec
         return self._compose_config(spec)
+
+    def _apply_mint_model_config(self) -> None:
+        self.config = self._with_mint_model_overrides(self.config)
+
+    @staticmethod
+    def _with_mint_model_overrides(spec: Mapping[str, Any], fallback_model_ref: str | None = None) -> dict[str, Any]:
+        merged = dict(spec)
+        model_ref = _model_ref_from_spec(merged) or fallback_model_ref
+        if not model_ref:
+            return merged
+        try:
+            cfg = get_model_config(model_ref)
+        except ValueError:
+            return merged
+        hydra = dict(merged.get("hydra") or {}) if isinstance(merged.get("hydra"), Mapping) else {}
+        overrides = [str(x) for x in hydra.get("overrides") or merged.get("hydra_overrides") or []]
+        if cfg.is_moe:
+            overrides = _drop_hydra_overrides(
+                overrides,
+                (
+                    "actor_rollout_ref.actor.fsdp_config",
+                    "actor_rollout_ref.ref.fsdp_config",
+                    "critic.fsdp_config",
+                ),
+            )
+            hydra.setdefault("config_name", "ppo_megatron_trainer")
+        overrides = _merge_hydra_overrides(
+            overrides,
+            _mint_hydra_overrides(model_ref, cfg),
+            replace=cfg.is_moe,
+        )
+        if overrides:
+            hydra["overrides"] = overrides
+            merged["hydra"] = hydra
+        resources = dict(merged.get("resources") or {}) if isinstance(merged.get("resources"), Mapping) else {}
+        resources.setdefault("train_gpus", cfg.train_gpus)
+        resources.setdefault("inference_gpus", cfg.inference_gpus)
+        merged["resources"] = resources
+        merged["model_config"] = cfg
+        return merged
 
     @staticmethod
     def _compose_config(spec: Mapping[str, Any]) -> Any:
@@ -432,9 +614,25 @@ class VerlTrainingBackend(TrainingBackend):
         return self._result(handle, out, increment=True)
 
     def forward_backward_reverse_kl(self, handle: SessionHandle, req: TrainOpRequest) -> TrainOpResult:
+        if self._uses_mint_style_grpo(req):
+            out = MintStyleGRPOTrainer(
+                self._trainer(handle),
+                adapter=self.batch_adapter,
+                max_token_len_per_gpu=int(req.options.get("max_token_len_per_gpu", 10240)),
+            ).step(req)
+            return self._result(handle, out, increment=True)
         data = self._data_for_request(req)
         out = _call_first(self._trainer(handle), ("grpo_step", "train_step", "fit_batch", "step", "update_actor"), data)
         return self._result(handle, out, increment=True)
+
+    def _uses_mint_style_grpo(self, req: TrainOpRequest) -> bool:
+        route = str(req.options.get("route") or req.options.get("execution_framework") or "").lower()
+        if route in {"mint_style", "mint-style", "mint"}:
+            return True
+        if isinstance(req.batch_payload, Mapping):
+            algo = str(req.batch_payload.get("algorithm") or req.options.get("algo") or "").lower()
+            return algo == "grpo" and bool(req.batch_payload.get("samples"))
+        return False
 
     def _run_dpo_loss(self, handle: SessionHandle, req: TrainOpRequest) -> TrainOpResult:
         data = self._data_for_request(req)

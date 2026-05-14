@@ -4,21 +4,60 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verl-mint"
-version = "0.1.0"
-description = "Minimal backend abstractions and router for verl-mint"
-readme = "README.md"
+version = "0.1.1"
+description = "Open MinT training runtime on veRL"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [
+  { name = "Mind Lab" },
+]
+maintainers = [
+  { name = "Mind Lab" },
+]
+keywords = ["mint", "verl", "rlhf", "sft", "grpo", "training-runtime"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["fastapi>=0.110"]
 
+[project.urls]
+Homepage = "https://github.com/verl-project/verl-mint"
+Repository = "https://github.com/verl-project/verl-mint"
+Documentation = "https://github.com/MindLab-Research/mint-doc"
+Issues = "https://github.com/verl-project/verl-mint/issues"
+Changelog = "https://github.com/verl-project/verl-mint/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
-qwen-sft = [
-  "torch>=2.3",
-  "transformers>=4.44",
-  "peft>=0.12",
-  "accelerate>=0.33",
+dev = [
+  "build>=1.2",
+  "httpx>=0.27",
+  "pytest>=8.0",
+  "uvicorn>=0.29",
 ]
-verl = []
+test = [
+  "httpx>=0.27",
+  "pytest>=8.0",
+]
+server = [
+  "uvicorn>=0.29",
+]
+qwen-sft = [
+  "torch>=2.3,<3",
+  "transformers>=4.44,<6",
+  "peft>=0.12,<1",
+  "accelerate>=0.33,<2",
+]
+ray = [
+  "ray[default]>=2.46.0,<3",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

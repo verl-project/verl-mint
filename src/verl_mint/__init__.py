@@ -31,6 +31,7 @@ from verl_mint.errors import (
     UnknownSessionError,
     UnsupportedOperationError,
 )
+from verl_mint.model_registry import ModelConfig, get_model_config, get_training_parallelism, normalize_model_name
 from verl_mint.router import BackendRegistry, BackendRouter
 from verl_mint.service import (
     BackendRegistryService,
@@ -39,7 +40,7 @@ from verl_mint.service import (
     RolloutService,
     TrainingService,
 )
-from verl_mint.storage import LocalStorageRepo, default_storage_root, storage_env_name
+from verl_mint.storage import LocalStorageRepo, default_storage_root, shared_storage_roots_env_name, storage_env_name
 
 
 def create_app(*args: Any, **kwargs: Any):
@@ -70,7 +71,12 @@ __all__ = [
     "VerlInferenceBackend",
     "LocalStorageRepo",
     "default_storage_root",
+    "shared_storage_roots_env_name",
     "MintService",
+    "ModelConfig",
+    "get_model_config",
+    "get_training_parallelism",
+    "normalize_model_name",
     "RolloutService",
     "RolloutSessionSpec",
     "RolloutSessionView",

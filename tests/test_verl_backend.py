@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from verl_mint.backends.verl import VerlBatchAdapter, VerlInferenceBackend, VerlTrainingBackend
+from verl_mint.model_registry import get_model_config, get_training_parallelism, normalize_model_name
 from verl_mint.contracts import (
     CheckpointRequest,
     GenerateRequest,
@@ -10,6 +12,9 @@ from verl_mint.contracts import (
     TrainOp,
     TrainOpRequest,
 )
+
+
+QWEN30B_MODEL_ID = "Qwen/Qwen3-30B-A3B-Base"
 
 
 class _FakeDataProto:
@@ -155,3 +160,162 @@ def test_verl_inference_backend_generate() -> None:
     assert result.text == "1 2 done"
     assert result.stop_reason == "stop"
     assert backend.rollout.config["temperature"] == 1.0
+
+
+def test_qwen30b_model_registry_matches_mint_tp4() -> None:
+    model = QWEN30B_MODEL_ID
+
+    assert normalize_model_name(model) == "Qwen/Qwen3-30B-A3B-Base"
+    cfg = get_model_config(model)
+    assert cfg.is_moe is True
+    assert cfg.inference_tp == 4
+    assert cfg.inference_dp == 1
+    assert cfg.train_tp == 4
+    assert cfg.train_ep == 1
+    assert cfg.train_lora_rank == 16
+    assert cfg.train_lora_alpha == 32
+    assert cfg.train_gpus == 4
+    assert cfg.inference_gpus == 4
+    assert get_training_parallelism(model) == (4, 1, 1, 1, None)
+
+
+def test_verl_ppo_job_runner_injects_mint_qwen30b_tp4_overrides() -> None:
+    import verl_fake_runtime
+
+    verl_fake_runtime.RUN_PPO_CALLS.clear()
+    model = QWEN30B_MODEL_ID
+    backend = VerlTrainingBackend(
+        config={
+            "model_path": model,
+            "trainer": {
+                "run_ppo": "verl_fake_runtime:run_ppo",
+                "remote_run_ppo": True,
+                "hydra": {"config_dir": "/path/to/verl/trainer/config", "overrides": []},
+            },
+        },
+        batch_adapter=VerlBatchAdapter(_FakeDataProto),
+    )
+    handle = backend.open_session(SessionSpec(session_id="qwen30b-tp4", backend_id="train", batch_codec="verl"))
+
+    trainer = backend._trainer(handle)
+    spec = trainer._config_from_batch(_FakeDataProto())
+    overrides = spec["hydra"]["overrides"]
+    assert f"actor_rollout_ref.model.path={model}" in overrides
+    assert "trainer.n_gpus_per_node=4" in overrides
+    assert spec["hydra"]["config_name"] == "ppo_megatron_trainer"
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=4" in overrides
+    assert "actor_rollout_ref.rollout.data_parallel_size=1" in overrides
+    assert "actor_rollout_ref.rollout.max_model_len=32768" in overrides
+    assert "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4" in overrides
+    assert "actor_rollout_ref.actor.megatron.expert_model_parallel_size=1" in overrides
+    assert "actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=4" in overrides
+    assert "actor_rollout_ref.actor.megatron.param_offload=True" in overrides
+    assert "actor_rollout_ref.actor.megatron.optimizer_offload=True" in overrides
+    assert "actor_rollout_ref.actor.megatron.grad_offload=True" in overrides
+    assert "actor_rollout_ref.actor.megatron.vanilla_mbridge=False" in overrides
+    assert "+actor_rollout_ref.actor.megatron.override_ddp_config.grad_reduce_in_fp32=True" in overrides
+    assert "actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True" in overrides
+    assert "actor_rollout_ref.actor.checkpoint.save_contents=[model,optimizer,extra]" in overrides
+    assert "actor_rollout_ref.actor.checkpoint.load_contents=[model,optimizer,extra]" in overrides
+    assert "+actor_rollout_ref.model.lora.rank=16" in overrides
+    assert "+actor_rollout_ref.model.lora.alpha=32" in overrides
+    assert "+actor_rollout_ref.model.lora.dtype=float16" in overrides
+    assert "+actor_rollout_ref.model.lora.type=lora" in overrides
+    assert "actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4" in overrides
+    assert "critic.megatron.tensor_model_parallel_size=4" in overrides
+    assert "critic.optim.override_optimizer_config.use_precision_aware_optimizer=True" in overrides
+    assert "critic.checkpoint.save_contents=[model,optimizer,extra]" in overrides
+    assert "critic.checkpoint.load_contents=[model,optimizer,extra]" in overrides
+    assert not any("fsdp_config" in item for item in overrides)
+    assert backend.config.resources["train_gpus"] == 4
+    assert backend.config.resources["inference_gpus"] == 4
+
+
+def test_mint_style_grpo_datums_group_center_advantages() -> None:
+    from verl_mint.backends.mint_style import build_mint_style_grpo_datums
+
+    payload = {
+        "algorithm": "grpo",
+        "samples": [
+            {
+                "sample_id": "a",
+                "group_id": "g",
+                "prompt_tokens": [1, 2],
+                "completion_tokens": [3, 4],
+                "old_logprobs": [-0.1, -0.2],
+                "weights": [1.0, 1.0],
+                "reward": 2.0,
+            },
+            {
+                "sample_id": "b",
+                "group_id": "g",
+                "prompt_tokens": [1, 2],
+                "completion_tokens": [5],
+                "old_logprobs": [-0.3],
+                "weights": [1.0],
+                "reward": 0.0,
+            },
+        ],
+    }
+
+    datums = build_mint_style_grpo_datums(payload)
+
+    assert datums[0]["model_input"]["chunks"][0]["tokens"] == [1, 2, 3, 4]
+    assert datums[0]["loss_fn_inputs"]["target_tokens"]["data"] == [3, 4]
+    assert datums[0]["loss_fn_inputs"]["logprobs"]["data"] == [-0.1, -0.2]
+    assert datums[0]["loss_fn_inputs"]["advantages"]["data"] == [1.0, 1.0]
+    assert datums[1]["loss_fn_inputs"]["advantages"]["data"] == [-1.0]
+
+
+def test_verl_training_backend_routes_grpo_samples_through_mint_style(tmp_path: Path) -> None:
+    backend = VerlTrainingBackend(
+        config={"trainer": {"class": "verl_fake_runtime:FakeTrainer"}},
+        batch_adapter=VerlBatchAdapter(_FakeDataProto),
+    )
+    handle = backend.open_session(SessionSpec(session_id="mint-style-grpo", backend_id="train", batch_codec="verl"))
+    adapter_uri = tmp_path / "adapter.bin"
+
+    result = backend.forward_backward_reverse_kl(
+        handle,
+        TrainOpRequest(
+            op=TrainOp.FORWARD_BACKWARD_REVERSE_KL,
+            batch_codec="verl",
+            batch_payload={
+                "algorithm": "grpo",
+                "samples": [
+                    {
+                        "sample_id": "0",
+                        "group_id": "g",
+                        "prompt_tokens": [1],
+                        "completion_tokens": [2, 3],
+                        "old_logprobs": [-0.1, -0.2],
+                        "weights": [1.0, 1.0],
+                        "reward": 1.0,
+                    },
+                    {
+                        "sample_id": "1",
+                        "group_id": "g",
+                        "prompt_tokens": [1],
+                        "completion_tokens": [4],
+                        "old_logprobs": [-0.3],
+                        "weights": [1.0],
+                        "reward": 0.0,
+                    },
+                ],
+            },
+            options={"route": "mint_style", "adapter_uri": str(adapter_uri)},
+        ),
+    )
+
+    trainer = backend._trainer(handle)
+    assert result.state.step == 1
+    assert result.outputs["execution_framework"] == "mint_style"
+    assert result.outputs["num_samples"] == 2
+    assert result.outputs["forward_backward"]["op"] == "mint_style_forward_backward"
+    assert result.outputs["optimizer"]["op"] == "optimizer_step"
+    assert result.outputs["adapter"]["uri"] == str(adapter_uri)
+    assert adapter_uri.read_text(encoding="utf-8") == "adapter"
+    assert trainer.last_batch.meta_info == {"algorithm": "grpo", "route": "mint_style"}
+    datums = trainer.last_batch.batch["mint_datums"]
+    assert datums[0]["loss_fn_inputs"]["advantages"]["data"] == [1.0, 1.0]
+    assert datums[1]["loss_fn_inputs"]["advantages"]["data"] == [-1.0]

@@ -61,7 +61,7 @@ class TrainingService:
         self._storage = storage
 
     def _resolve_checkpoint_uri(self, uri: str) -> str:
-        if uri.startswith(("mint://", "tinker://", "repo://")):
+        if uri.startswith(("mint://", "repo://")):
             return self._storage.resolve_for_read(uri)
         return uri
 
@@ -87,7 +87,7 @@ class TrainingService:
                 )
             return payload
 
-        if raw_path.startswith(("mint://", "tinker://", "repo://")):
+        if raw_path.startswith(("mint://", "repo://")):
             if requires_portable_uri:
                 self._storage.require_shared_storage(
                     reason="portable reverse KL reference checkpoint"
@@ -100,7 +100,7 @@ class TrainingService:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             raise ValueError(
-                "portable reverse KL reference_model_path must use mint://, tinker://, repo://, "
+                "portable reverse KL reference_model_path must use mint://, repo://, "
                 "or an absolute shared filesystem path"
             )
         normalized = path.resolve()
@@ -388,7 +388,7 @@ class RolloutService:
                 )
             return resolved
 
-        if raw_path.startswith(("mint://", "tinker://", "repo://")):
+        if raw_path.startswith(("mint://", "repo://")):
             if requires_portable_uri:
                 self._storage.require_shared_storage(
                     reason="portable rollout reference checkpoint"
@@ -401,7 +401,7 @@ class RolloutService:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             raise ValueError(
-                "portable rollout reference_model_path must use mint://, tinker://, repo://, "
+                "portable rollout reference_model_path must use mint://, repo://, "
                 "or an absolute shared filesystem path"
             )
         normalized = path.resolve()

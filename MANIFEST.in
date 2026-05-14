@@ -1,0 +1,11 @@
+include README.md
+include README_zh.md
+include CONTRIBUTING.md
+include CHANGELOG.md
+include LICENSE
+include .env.example
+include uv.lock
+include uv.toml
+recursive-include scripts *.py
+recursive-include scripts/data *.jsonl
+recursive-include tests *.py

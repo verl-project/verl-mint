@@ -5,6 +5,7 @@ from email.utils import format_datetime
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
+from verl_mint.model_registry import get_model_config
 from verl_mint.schemas import (
     CapabilitiesResponse,
     CollectExperienceRequest,
@@ -231,13 +232,42 @@ def _fb_output_v1(result, *, loss_fn: str | None = None, forward_backward_input:
     }
 
 
-def _select_backend_id(service: MintService, kind: BackendKind, requested: str | None) -> str:
+def _select_backend_id(
+    service: MintService,
+    kind: BackendKind,
+    requested: str | None,
+    *,
+    base_model: str | None = None,
+) -> str:
     if requested:
         return requested
-    for spec in service.backends.list():
-        if spec.kind == kind:
-            return spec.backend_id
-    raise HTTPException(status_code=400, detail=f"No {kind.value} backend registered")
+    specs = [spec for spec in service.backends.list() if spec.kind == kind]
+    if not specs:
+        raise HTTPException(status_code=400, detail=f"No {kind.value} backend registered")
+    if kind == BackendKind.TRAINING and base_model:
+        try:
+            model_cfg = get_model_config(base_model)
+        except ValueError:
+            model_cfg = None
+        if model_cfg is not None and model_cfg.is_moe:
+            matches = [
+                spec
+                for spec in specs
+                if spec.provider.lower() in {"verl", "megatron"}
+                or str(spec.config.get("strategy", "")).lower() == "megatron"
+            ]
+            if len(matches) == 1:
+                return matches[0].backend_id
+            if len(matches) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Ambiguous Megatron training backend for base_model '{base_model}'",
+                )
+            raise HTTPException(
+                status_code=400,
+                detail=f"MoE base_model '{base_model}' requires a Megatron training backend",
+            )
+    return specs[0].backend_id
 
 
 def create_app(service: MintService | None = None) -> FastAPI:
@@ -269,14 +299,6 @@ def create_app(service: MintService | None = None) -> FastAPI:
 
     def _has_uri_scheme(path: str | None) -> bool:
         return bool(path) and "://" in path
-
-    def _public_uri_aliases(path: str) -> set[str]:
-        aliases = {path}
-        if path.startswith("mint://"):
-            aliases.add("tinker://" + path[len("mint://") :])
-        elif path.startswith("tinker://"):
-            aliases.add("mint://" + path[len("tinker://") :])
-        return aliases
 
     def _training_checkpoint_uri(model_id: str, requested_path: str | None, *, versioned: bool) -> str:
         if _has_uri_scheme(requested_path):
@@ -401,35 +423,38 @@ def create_app(service: MintService | None = None) -> FastAPI:
 
     def _checkpoint_uri_aliases(model_id: str, entry: dict) -> set[str]:
         path = str(entry["mint_path"])
-        aliases = _public_uri_aliases(path)
+        aliases = {path}
         if not _has_uri_scheme(path):
             checkpoint_kind = "weights" if entry["checkpoint_type"] == "training" else "sampler_weights"
-            aliases.add(f"tinker://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}")
+            aliases.add(f"mint://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}")
         return aliases
 
     def _checkpoint_public_path(model_id: str, entry: dict, *, versioned: bool) -> str:
         path = str(entry["mint_path"])
-        if not versioned:
+        if not versioned or _has_uri_scheme(path):
             return path
-        if path.startswith("tinker://"):
-            return path
-        if path.startswith("mint://"):
-            return "tinker://" + path[len("mint://") :]
         checkpoint_kind = "weights" if entry["checkpoint_type"] == "training" else "sampler_weights"
-        return f"tinker://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}"
+        return f"mint://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}"
+
+    def _checkpoint_api_payload(entry: dict, path: str) -> dict:
+        return {
+            "id": entry["checkpoint_id"],
+            "checkpoint_id": entry["checkpoint_id"],
+            "checkpoint_type": entry["checkpoint_type"],
+            "object": "checkpoint",
+            "created_at": entry["created_at"],
+            "time": entry["time"],
+            "path": path,
+            "mint_path": path,
+            "size_bytes": entry["size_bytes"],
+            "public": entry["public"],
+            "expires_at": entry["expires_at"],
+        }
 
     def _checkpoint_payload(model_id: str, entry: dict, *, versioned: bool) -> dict:
         public_path = _checkpoint_public_path(model_id, entry, versioned=versioned)
         if versioned:
-            return {
-                "checkpoint_id": entry["checkpoint_id"],
-                "checkpoint_type": entry["checkpoint_type"],
-                "time": entry["time"],
-                "tinker_path": public_path,
-                "size_bytes": entry["size_bytes"],
-                "public": entry["public"],
-                "expires_at": entry["expires_at"],
-            }
+            return _checkpoint_api_payload(entry, public_path)
         return CheckpointInfo(
             checkpoint_id=entry["checkpoint_id"],
             checkpoint_type=entry["checkpoint_type"],
@@ -479,6 +504,14 @@ def create_app(service: MintService | None = None) -> FastAPI:
         if not versioned:
             payload["last_activity"] = 0.0
             payload["idle_for_s"] = 0.0
+        else:
+            payload.update(
+                {
+                    "id": view.session_id,
+                    "object": "training_run",
+                    "model": payload["base_model"],
+                }
+            )
         return payload
 
     def _find_checkpoint(model_id: str, checkpoint_id: str) -> dict | None:
@@ -514,7 +547,11 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.get("/api/v1/server_info")
     @app.get("/server_info")
     def server_info():
-        return {"server": "verl-mint", "storage_root": str(service.storage.root)}
+        return {
+            "server": "verl-mint",
+            "storage_configured": True,
+            "storage_shared": service.storage.is_explicitly_shared(),
+        }
 
     @app.post("/api/v1/create_session")
     @app.post("/create_session")
@@ -706,7 +743,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/create_model")
     def create_model(body: CreateModelRequest):
         model_id = _model_id(body.session_id, body.model_seq_id)
-        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id)
+        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id, base_model=body.base_model)
         view = service.training.create_model(
             model_id=model_id,
             backend_id=backend_id,
@@ -739,7 +776,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/create_model_from_state")
     def create_model_from_state(body: CreateModelFromStateRequest):
         model_id = _model_id(body.session_id, body.model_seq_id)
-        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id)
+        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id, base_model=body.base_model)
         view = service.training.create_model_from_state(
             model_id=model_id,
             backend_id=backend_id,
@@ -772,7 +809,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/api/v1/create_model")
     def create_model_v1(body: CreateModelRequest):
         model_id = _model_id(body.session_id, body.model_seq_id)
-        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id)
+        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id, base_model=body.base_model)
         view = service.training.create_model(
             model_id=model_id,
             backend_id=backend_id,
@@ -800,7 +837,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/api/v1/create_model_from_state")
     def create_model_from_state_v1(body: CreateModelFromStateRequest):
         model_id = _model_id(body.session_id, body.model_seq_id)
-        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id)
+        backend_id = _select_backend_id(service, BackendKind.TRAINING, body.backend_id, base_model=body.base_model)
         view = service.training.create_model_from_state(
             model_id=model_id,
             backend_id=backend_id,
@@ -1270,6 +1307,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
         if versioned:
             return {
                 "training_runs": runs,
+                "object": "list",
+                "data": runs,
                 "cursor": {"offset": offset, "limit": limit, "total_count": len(all_runs)},
             }
         return TrainingRunsResponse(training_runs=[TrainingRun(**run) for run in runs])
@@ -1294,6 +1333,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
         if versioned:
             return {
                 "checkpoints": entries,
+                "object": "list",
+                "data": entries,
                 "cursor": {"offset": offset, "limit": limit, "total_count": len(all_entries)},
             }
         return CheckpointsListResponse(model_id=model_id, checkpoints=[CheckpointInfo(**entry) for entry in entries])
@@ -1309,6 +1350,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
         entries = all_entries[offset : offset + limit]
         return {
             "checkpoints": entries,
+            "object": "list",
+            "data": entries,
             "cursor": {"offset": offset, "limit": limit, "total_count": len(all_entries)},
         }
 

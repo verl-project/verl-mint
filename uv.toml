@@ -1,0 +1,2 @@
+# Keep this repository's lockfile stable regardless of a developer's global uv config.
+index-url = "https://pypi.org/simple"

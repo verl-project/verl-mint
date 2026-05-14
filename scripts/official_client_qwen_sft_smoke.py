@@ -17,6 +17,8 @@ from verl_mint.milestone1 import MILESTONE1_BASE_MODEL_ID
 from verl_mint.service import MintService
 from verl_mint.storage import LocalStorageRepo
 
+SMOKE_CLIENT_TOKEN = "unused"
+
 
 class ServerThread(threading.Thread):
     def __init__(self, *, host: str, port: int, storage_root: Path) -> None:
@@ -94,7 +96,7 @@ def main() -> None:
 
     try:
         wait_for_port(args.host, port)
-        svc = mint.ServiceClient(base_url=f"http://{args.host}:{port}", api_key="sk-local")
+        svc = mint.ServiceClient(base_url=f"http://{args.host}:{port}", api_key=SMOKE_CLIENT_TOKEN)
         train = svc.create_lora_training_client(
             base_model=MILESTONE1_BASE_MODEL_ID,
             rank=16,

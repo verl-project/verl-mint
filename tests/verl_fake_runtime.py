@@ -44,6 +44,18 @@ class FakeTrainer:
         self.step += 1
         return {"loss": 0.125, "op": "grpo", "step": self.step}
 
+    def forward_backward_ppo(self, batch) -> Mapping[str, Any]:
+        self.last_batch = batch
+        return {"loss": 0.03125, "op": "mint_style_forward_backward"}
+
+    def optimizer_step(self) -> Mapping[str, Any]:
+        self.step += 1
+        return {"step": self.step, "op": "optimizer_step"}
+
+    def export_lora_adapter(self, uri: str) -> Mapping[str, Any]:
+        Path(uri).write_text("adapter", encoding="utf-8")
+        return {"uri": uri, "format": "lora"}
+
     def dpo_step(self, batch) -> Mapping[str, Any]:
         self.last_batch = batch
         self.step += 1
