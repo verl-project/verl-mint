@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from verl_mint.backends.base import Backend, InferenceBackend, TrainingBackend
-from verl_mint.backends.verl import VerlBatchAdapter, VerlInferenceBackend, VerlTrainingBackend
 from verl_mint.contracts import (
     ArtifactRef,
     BackendKind,
@@ -42,11 +41,28 @@ from verl_mint.service import (
 )
 from verl_mint.storage import LocalStorageRepo, default_storage_root, shared_storage_roots_env_name, storage_env_name
 
+_LAZY_EXPORTS = {
+    "VerlBatchAdapter": ("verl_mint.backends.verl", "VerlBatchAdapter"),
+    "VerlTrainingBackend": ("verl_mint.backends.verl", "VerlTrainingBackend"),
+    "VerlInferenceBackend": ("verl_mint.backends.verl", "VerlInferenceBackend"),
+}
+
 
 def create_app(*args: Any, **kwargs: Any):
     from verl_mint.app import create_app as _create_app
 
     return _create_app(*args, **kwargs)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_EXPORTS:
+        import importlib
+
+        module_name, attr_name = _LAZY_EXPORTS[name]
+        value = getattr(importlib.import_module(module_name), attr_name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

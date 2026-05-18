@@ -3,21 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any
 
-from _grpo_smoke_common import ServerThread, find_free_port, post_json, retrieve_future, wait_for_port
-from verl_mint import create_app
-from verl_mint.backends.base import InferenceBackend
-from verl_mint.backends.verl import VerlTrainingBackend
-from verl_mint.contracts import BackendKind, BackendSpec, GenerateRequest, GenerateResult
-from verl_mint.milestone1 import MILESTONE1_BASE_MODEL_ID
-from verl_mint.service import MintService
-from verl_mint.storage import LocalStorageRepo, default_storage_root, storage_env_name
-
-
-class _NoopInferenceBackend(InferenceBackend):
-    def generate(self, req: GenerateRequest) -> GenerateResult:
-        return GenerateResult(text=req.prompt, token_ids=[], stop_reason="noop")
+from server_smoke import ServerThread, find_free_port, verl_ppo_app, wait_for_port
+from client_scenarios import run_verl_ppo_job_smoke
+from verl_mint.defaults import DEFAULT_BASE_MODEL_ID
+from verl_mint.storage import default_storage_root, storage_env_name
 
 
 def _overrides(args: argparse.Namespace) -> list[str]:
@@ -92,7 +82,11 @@ def main() -> None:
     parser.add_argument("--config-name", default="ppo_trainer")
     parser.add_argument("--run-ppo", default="verl.trainer.main_ppo:run_ppo")
     parser.add_argument("--remote-run-ppo", action="store_true")
-    parser.add_argument("--model-path", default=os.environ.get("MODEL_PATH", MILESTONE1_BASE_MODEL_ID))
+    parser.add_argument(
+        "--runtime-env-root",
+        default=os.environ.get("VERL_MINT_RUNTIME_ENV_ROOT"),
+    )
+    parser.add_argument("--model-path", default=os.environ.get("MODEL_PATH", DEFAULT_BASE_MODEL_ID))
     parser.add_argument("--train-files", required=True)
     parser.add_argument("--val-files", required=True)
     parser.add_argument("--total-steps", type=_positive_int, default=20)
@@ -121,89 +115,40 @@ def main() -> None:
     if args.config_dir is None:
         raise SystemExit("--config-dir or VERL_CONFIG_DIR is required")
 
-    storage = LocalStorageRepo(Path(args.storage_root))
-    storage.ensure()
-    service = MintService(storage=storage)
-    service.backends.register(
-        BackendSpec(
-            backend_id="verl-infer",
-            kind=BackendKind.INFERENCE,
-            provider="verl",
-            model_family="qwen",
-        ),
-        _NoopInferenceBackend(),
-    )
-    service.backends.register(
-        BackendSpec(
-            backend_id="verl-train",
-            kind=BackendKind.TRAINING,
-            provider="verl",
-            model_family="qwen",
-        ),
-        VerlTrainingBackend(
-            backend_kwargs={"trainer": {"run_ppo": args.run_ppo, "remote_run_ppo": args.remote_run_ppo}}
-        ),
-    )
+    trainer_config = {
+        "run_ppo": args.run_ppo,
+        "remote_run_ppo": args.remote_run_ppo,
+        "hydra": {
+            "config_dir": args.config_dir,
+            "config_name": args.config_name,
+            "overrides": _overrides(args),
+        },
+    }
+    if args.runtime_env_root:
+        trainer_config["runtime_env_root"] = args.runtime_env_root
 
     port = args.port or find_free_port()
-    server = ServerThread(app=create_app(service), host=args.host, port=port)
+    server = ServerThread(
+        app=verl_ppo_app(
+            Path(args.storage_root),
+            model_path=args.model_path,
+            trainer_config=trainer_config,
+        ),
+        host=args.host,
+        port=port,
+    )
     server.start()
-    base_url = f"http://{args.host}:{port}"
 
     try:
-        wait_for_port(args.host, port)
-        create_future = post_json(
-            base_url,
-            "/create_model",
-            {
-                "session_id": "ppo-20step",
-                "model_seq_id": 1,
-                "base_model": args.model_path,
-                "backend_id": "verl-train",
-                "batch_codec": "verl",
-                "lora_config": {"rank": args.lora_rank},
-                "user_metadata": {"algorithm": "ppo", "execution_framework": "verl"},
-            },
-        )
-        create_payload = retrieve_future(base_url, create_future)
-        model_id = create_payload["model_id"]
-        post_json(
-            base_url,
-            "/rollout_sessions",
-            {
-                "rollout_session_id": "ppo-20step-rollout",
-                "inference_backend_id": "verl-infer",
-                "training_session_id": model_id,
-                "metadata": {"algorithm": "ppo"},
-            },
-        )
-        result = post_json(
-            base_url,
-            "/rollout_sessions/ppo-20step-rollout/train",
-            {
-                "extension_op": "rl",
-                "batch_payload": {
-                    "tensors": {},
-                    "algorithm": "ppo",
-                    "hydra": {
-                        "config_dir": args.config_dir,
-                        "config_name": args.config_name,
-                        "overrides": _overrides(args),
-                    },
-                },
-                "options": {"train_op": "forward_backward_ppo", "algo": "ppo"},
-            },
+        wait_for_port(args.host, port, timeout_s=120)
+        run_verl_ppo_job_smoke(
+            f"http://{args.host}:{port}",
+            base_model=args.model_path,
+            learning_rate=args.actor_lr,
         )
     finally:
         server.stop()
         server.join(timeout=10)
-
-    print(f"mint_state_step {result['state']['step']}")
-    outputs: dict[str, Any] = result.get("outputs", {})
-    for key in sorted(outputs):
-        value = outputs[key]
-        if isinstance(value, (int, float, str)):
-            print(f"mint_output {key}={value}")
 
 
 if __name__ == "__main__":

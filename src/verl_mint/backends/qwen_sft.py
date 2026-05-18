@@ -22,7 +22,7 @@ from verl_mint.contracts import (
 )
 from verl_mint.model_registry import get_model_config
 from verl_mint.errors import UnsupportedOperationError
-from verl_mint.milestone1 import MILESTONE1_BASE_MODEL_ID, MILESTONE1_MODEL_PATH_ENV
+from verl_mint.defaults import DEFAULT_BASE_MODEL_ID, QWEN_MODEL_PATH_ENV
 from verl_mint.storage import LocalStorageRepo
 
 try:
@@ -49,7 +49,7 @@ def _require_runtime() -> None:
 
 
 def _resolve_model_ref(base_model: str | None) -> str:
-    return os.environ.get(MILESTONE1_MODEL_PATH_ENV, base_model or MILESTONE1_BASE_MODEL_ID)
+    return os.environ.get(QWEN_MODEL_PATH_ENV, base_model or DEFAULT_BASE_MODEL_ID)
 
 
 def _resolve_hidden_size(model: Any) -> int:
@@ -196,7 +196,7 @@ class _TrainSession:
     device: Any
     step: int = 0
     last_loss: float = 0.0
-    base_model: str = MILESTONE1_BASE_MODEL_ID
+    base_model: str = DEFAULT_BASE_MODEL_ID
     lora_rank: int = 16
 
 
@@ -227,7 +227,7 @@ class QwenSFTTrainingBackend(TrainingBackend):
     def __init__(
         self,
         *,
-        model_id: str = MILESTONE1_BASE_MODEL_ID,
+        model_id: str = DEFAULT_BASE_MODEL_ID,
         learning_rate: float = 3e-4,
     ) -> None:
         _require_runtime()
@@ -911,10 +911,22 @@ class QwenSFTTrainingBackend(TrainingBackend):
         if not hasattr(loss_inputs, "get"):
             raise ValueError("DPO loss_fn_inputs must be a mapping")
 
-        pair_id = str(loss_inputs.get("pair_id") or "")
+        pair_id_value = loss_inputs.get("pair_id")
+        if isinstance(pair_id_value, str):
+            pair_id = pair_id_value
+        else:
+            pair_id_numbers = _tensor_ints(pair_id_value)
+            pair_id = str(pair_id_numbers[0]) if pair_id_numbers else str(pair_id_value or "")
         if not pair_id:
             raise ValueError("DPO datum is missing pair_id")
-        role = str(loss_inputs.get("role") or "").lower()
+        role_value = loss_inputs.get("role")
+        if isinstance(role_value, str):
+            role = role_value.lower()
+        else:
+            role_numbers = _tensor_ints(role_value)
+            role = ""
+        if not role and role_numbers:
+            role = "chosen" if int(role_numbers[0]) > 0 else "rejected"
         if role not in {"chosen", "rejected"}:
             raise ValueError("DPO datum role must be chosen or rejected")
 
@@ -979,9 +991,15 @@ class QwenSFTTrainingBackend(TrainingBackend):
         if not hasattr(item, "get"):
             raise ValueError("RL datum must be a mapping")
 
+        loss_inputs = item.get("loss_fn_inputs", {})
+        if not hasattr(loss_inputs, "get"):
+            loss_inputs = {}
+
         prompt_tokens = [int(x) for x in item.get("prompt_tokens", [])]
         if not prompt_tokens:
             prompt_tokens = _chunk_tokens(item.get("student_input", {}))
+        if not prompt_tokens:
+            prompt_tokens = _chunk_tokens(item.get("model_input", {}))
         if not prompt_tokens:
             raise ValueError("RL datum is missing prompt tokens")
 
@@ -993,21 +1011,36 @@ class QwenSFTTrainingBackend(TrainingBackend):
 
         completion_tokens = [int(x) for x in item.get("completion_tokens", [])]
         if not completion_tokens:
-            target = item.get("target_tokens")
+            target = item.get("target_tokens") or loss_inputs.get("target_tokens")
             completion_tokens = [int(x) for x in _tensor_values(target)]
         if not completion_tokens:
             raise ValueError("RL datum is missing completion tokens")
 
-        old_logprobs = tuple(_tensor_values(item.get("old_logprobs")))
-        reference_logprobs = tuple(_tensor_values(item.get("reference_logprobs")))
+        old_logprobs = tuple(_tensor_values(item.get("old_logprobs") or loss_inputs.get("old_logprobs")))
+        reference_logprobs = tuple(
+            _tensor_values(item.get("reference_logprobs") or loss_inputs.get("reference_logprobs"))
+        )
 
-        old_values = tuple(_tensor_values(item.get("old_values") or item.get("values")))
-        advantages = tuple(_tensor_values(item.get("advantages") or item.get("advantage")))
-        returns = tuple(_tensor_values(item.get("returns") or item.get("value_targets")))
-        weights = tuple(_tensor_values(item.get("weights")))
-        reward = float(item.get("reward", 0.0))
-        group_id = str(item.get("group_id") or "default")
-        sample_id = str(item.get("sample_id") or sample_index)
+        old_values = tuple(_tensor_values(item.get("old_values") or item.get("values") or loss_inputs.get("old_values") or loss_inputs.get("values")))
+        advantages = tuple(
+            _tensor_values(item.get("advantages") or item.get("advantage") or loss_inputs.get("advantages") or loss_inputs.get("advantage"))
+        )
+        returns = tuple(_tensor_values(item.get("returns") or item.get("value_targets") or loss_inputs.get("returns") or loss_inputs.get("value_targets")))
+        weights = tuple(_tensor_values(item.get("weights") or loss_inputs.get("weights") or loss_inputs.get("loss_mask")))
+        reward_values = _tensor_values(item.get("reward") or loss_inputs.get("reward"))
+        reward = float(reward_values[0]) if reward_values else float(item.get("reward", 0.0))
+        group_source = item.get("group_id") or loss_inputs.get("group_id")
+        sample_source = item.get("sample_id") or loss_inputs.get("sample_id")
+        if isinstance(group_source, str):
+            group_id = group_source
+        else:
+            group_values = _tensor_ints(group_source)
+            group_id = str(group_values[0]) if group_values else "default"
+        if isinstance(sample_source, str):
+            sample_id = sample_source
+        else:
+            sample_values = _tensor_ints(sample_source)
+            sample_id = str(sample_values[0]) if sample_values else str(sample_index)
 
         return _RLSample(
             prompt_tokens=tuple(prompt_tokens),
@@ -1155,7 +1188,7 @@ def _load_qwen_model_from_reference(
 
 
 class QwenTextInferenceBackend(InferenceBackend):
-    def __init__(self, *, model_id: str = MILESTONE1_BASE_MODEL_ID) -> None:
+    def __init__(self, *, model_id: str = DEFAULT_BASE_MODEL_ID) -> None:
         _require_runtime()
         self.model_id = model_id
         self.model_ref = _resolve_model_ref(model_id)

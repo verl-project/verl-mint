@@ -1374,7 +1374,7 @@ def test_fastapi_returns_mint_like_response_skeletons(tmp_path) -> None:
     assert sampler_save_v1_resp.status_code == 200
     sampler_save_v1_payload = client.post("/api/v1/retrieve_future", json=sampler_save_v1_resp.json()).json()
     assert sampler_save_v1_payload["type"] == "save_weights_for_sampler"
-    assert sampler_save_v1_payload["path"] == "mint://sess:1/sampler_weights/sampler-v1-sess-1.pt"
+    assert sampler_save_v1_payload["path"] == "mint://sess-1/sampler_weights/sampler-v1-sess-1.pt"
     assert "sampling_session_id" not in sampler_save_v1_payload or sampler_save_v1_payload["sampling_session_id"] is None
 
     sampler_checkpoint_id = sampler_save_v1_payload["path"].split("/")[-1]
@@ -1399,7 +1399,7 @@ def test_fastapi_returns_mint_like_response_skeletons(tmp_path) -> None:
     sampler_handoff_detail = client.get(f"/samplers/{sampler_handoff_id}")
     assert sampler_handoff_detail.status_code == 200
     handoff_model_path = sampler_handoff_detail.json()["model_path"]
-    assert handoff_model_path == "mint://sess:1/sampler_weights/sampler-9.pt"
+    assert handoff_model_path == "mint://sess-1/sampler_weights/sampler-9.pt"
     handoff_checkpoint_id = handoff_model_path.split("/")[-1]
     handoff_archive = client.get(
         f"/api/v1/training_runs/sess:1/checkpoints/{handoff_checkpoint_id}/archive",
@@ -1586,11 +1586,15 @@ def test_versioned_save_uses_mint_paths_and_weights_info_aliases(tmp_path) -> No
     )
     save_resp = client.post("/api/v1/save_weights", json={"model_id": "sess:1", "path": "checkpoint-001"})
     save_payload = client.post("/api/v1/retrieve_future", json=save_resp.json()).json()
-    assert save_payload["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert save_payload["path"] == "mint://sess-1/weights/checkpoint-001"
+    parsed_saved = urlsplit(save_payload["path"])
+    local_saved_path = tmp_path / parsed_saved.netloc / parsed_saved.path.lstrip("/")
+    assert local_saved_path.exists()
+    assert ":" not in str(local_saved_path.relative_to(tmp_path))
 
-    weights_info_mint = client.post("/api/v1/weights_info", json={"mint_path": "mint://sess:1/weights/checkpoint-001"})
+    weights_info_mint = client.post("/api/v1/weights_info", json={"mint_path": "mint://sess-1/weights/checkpoint-001"})
     assert weights_info_mint.status_code == 200
-    weights_info_legacy = client.post("/weights_info", json={"mint_path": "mint://sess:1/weights/checkpoint-001"})
+    weights_info_legacy = client.post("/weights_info", json={"mint_path": "mint://sess-1/weights/checkpoint-001"})
     assert weights_info_legacy.status_code == 200
 
     training_runs_resp = client.get("/api/v1/training_runs")
@@ -1605,21 +1609,21 @@ def test_versioned_save_uses_mint_paths_and_weights_info_aliases(tmp_path) -> No
     training_run_payload = training_run_resp.json()
     assert training_run_payload["id"] == "sess:1"
     assert training_run_payload["model"] == "llama"
-    assert training_run_payload["last_checkpoint"]["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert training_run_payload["last_checkpoint"]["path"] == "mint://sess-1/weights/checkpoint-001"
 
     checkpoints_resp = client.get("/api/v1/training_runs/sess:1/checkpoints")
     assert checkpoints_resp.status_code == 200
     checkpoints_payload = checkpoints_resp.json()
     assert checkpoints_payload["object"] == "list"
-    assert checkpoints_payload["data"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert checkpoints_payload["data"][0]["path"] == "mint://sess-1/weights/checkpoint-001"
 
     all_checkpoints_resp = client.get("/api/v1/checkpoints")
     assert all_checkpoints_resp.status_code == 200
-    assert all_checkpoints_resp.json()["data"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert all_checkpoints_resp.json()["data"][0]["path"] == "mint://sess-1/weights/checkpoint-001"
 
     all_checkpoints_legacy_resp = client.get("/checkpoints")
     assert all_checkpoints_legacy_resp.status_code == 200
-    assert all_checkpoints_legacy_resp.json()["checkpoints"][0]["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert all_checkpoints_legacy_resp.json()["checkpoints"][0]["path"] == "mint://sess-1/weights/checkpoint-001"
 
     paged_v1 = client.get("/api/v1/checkpoints?offset=0&limit=1")
     assert paged_v1.status_code == 200
@@ -1638,7 +1642,7 @@ def test_versioned_save_uses_mint_paths_and_weights_info_aliases(tmp_path) -> No
     assert checkpoint_detail_resp.status_code == 200
     checkpoint_detail_payload = checkpoint_detail_resp.json()
     assert checkpoint_detail_payload["checkpoint_id"] == checkpoint_id
-    assert checkpoint_detail_payload["path"] == "mint://sess:1/weights/checkpoint-001"
+    assert checkpoint_detail_payload["path"] == "mint://sess-1/weights/checkpoint-001"
 
     archive_resp = client.get(
         f"/api/v1/training_runs/sess:1/checkpoints/{checkpoint_id}/archive",

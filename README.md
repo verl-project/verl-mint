@@ -15,7 +15,7 @@
 
 ## What verl-mint is
 
-`verl-mint` is the commercial open-source edition of the [MinT](https://mint-console.macaron.xin/) training runtime. The commercial MinT SaaS gives users hosted training infrastructure through the MinT SDK. `verl-mint` exposes the same training mental model for teams that want to run MinT-style SFT and RL workloads on their own GPUs, their own Ray cluster, and their own artifact storage.
+`verl-mint` is the commercial open-source edition of the [MinT](https://mint-console.macaron.xin/) training runtime. The commercial MinT SaaS gives users hosted training infrastructure through the MinT SDK. `verl-mint` exposes the same training mental model for teams that want to run MinT-style workloads on their own GPUs, their own Ray or veRL cluster, and their own artifact storage.
 
 The server exposes the MinT training workflow at the API boundary, so clients can keep familiar session, checkpoint, sampler, and future semantics while moving execution onto the MinT and veRL stack.
 
@@ -35,31 +35,23 @@ The project is built in collaboration with veRL as the training execution founda
 
 | Model family | Size | Status | Notes |
 | --- | --- | --- | --- |
-| Qwen | 0.6B | Available | Local Qwen SFT/RL smoke path |
-| Qwen | 4B | Available | Validated model-backed run |
+| Qwen | 0.6B | Available | veRL trainer smoke path |
+| Qwen | 4B | Available | veRL model-backed run |
 | Qwen | 8B | Planned | Not yet validated |
-| Qwen | 30B | Available | Validated distributed veRL/Ray run |
+| Qwen | 30B | Available | veRL/Ray run |
 
 ## Install
 
 ```bash
 git clone https://github.com/verl-project/verl-mint.git
 cd verl-mint
-uv sync --extra qwen-sft
+uv sync --extra smoke
 ```
 
-Install the MinT SDK from the MindLab repository:
+The `smoke` extra installs the official MinT SDK from the MindLab repository:
+`mindlab-toolkit @ git+https://github.com/MindLab-Research/mindlab-toolkit.git`.
 
-```bash
-uv pip install "git+https://github.com/MindLab-Research/mindlab-toolkit.git"
-```
-
-For local development with an SDK checkout:
-
-```bash
-export MINT_SDK_PATH=/path/to/mindlab-toolkit/src
-export PYTHONPATH=$MINT_SDK_PATH:src
-```
+Local SDK checkouts are useful for reading source, but smoke runs should use the installed `mindlab-toolkit` dependency rather than `PYTHONPATH`.
 
 For cluster runs, `verl-mint` assumes the execution environment already exists; it does not provision Ray, GPUs, or worker images.
 
@@ -79,49 +71,95 @@ uv sync --extra ray
 
 | Path | Entry point |
 | --- | --- |
-| Contract smoke | `scripts/official_client_fake_backend_smoke.py` |
-| Qwen SFT | `scripts/official_client_qwen_sft_smoke.py` |
-| GRPO | `scripts/official_client_qwen_grpo_smoke.py` |
-| veRL cluster | `scripts/official_client_verl_cluster_smoke.py` |
-| Distributed GRPO | `scripts/official_client_verl_grpo_cluster_smoke.py` |
+| Smoke server: contract | `scripts/smoke_fake_backend.py` |
+| Smoke server: Qwen SFT diagnostic | `scripts/smoke_qwen_sft.py` |
+| Smoke server: veRL trainer job | `scripts/smoke_verl_ppo_job.py` |
+| Remote SDK client smoke | `scripts/client_verl_ppo_job_smoke.py --base-url http://<host>:8000` |
 
 Run the contract smoke with a lightweight backend:
 
 ```bash
-uv run --env-file /dev/null env PYTHONPATH=$PYTHONPATH \
-  python scripts/official_client_fake_backend_smoke.py
+uv run --env-file /dev/null --extra smoke \
+  python scripts/smoke_fake_backend.py
 ```
 
-Run the local Qwen SFT path:
+Run the local Qwen SFT diagnostic path. This checks API compatibility with a small local PyTorch backend; it is not the recommended model-backed training path:
 
 ```bash
-uv run --env-file /dev/null env PYTHONPATH=$PYTHONPATH \
-  python scripts/official_client_qwen_sft_smoke.py
+uv run --env-file /dev/null --extra smoke \
+  python scripts/smoke_qwen_sft.py
 ```
 
-Run the GRPO path:
+Run an SDK-driven veRL trainer job smoke:
 
 ```bash
-uv run --env-file /dev/null env PYTHONPATH=$PYTHONPATH \
-  python scripts/official_client_qwen_grpo_smoke.py
+export VERL_CONFIG_DIR=/workspace/verl/verl/trainer/config
+
+uv run --env-file /dev/null --extra smoke --extra ray \
+  python scripts/smoke_verl_ppo_job.py \
+  --config-dir "$VERL_CONFIG_DIR" \
+  --model-path Qwen/Qwen3-0.6B \
+  --train-files /path/to/train.parquet \
+  --val-files /path/to/val.parquet \
+  --total-steps 1
+```
+
+All `client_*` scripts exercise an already-running service through the installed MinT SDK and require `--base-url`. Scripts that start a local smoke server and immediately run the matching SDK scenario live under `scripts/smoke_*.py`. Scripts that post directly to server routes are server/API diagnostics, not client contract tests, and should not be named or treated as client smoke tests.
+
+## Simple cluster service
+
+For the open-source runtime, keep deployment simple: start one HTTP service on a network-reachable cluster node, point the official SDK at it, run a smoke or example, and stop the service with `Ctrl-C` or SIGTERM. This is not a production deployment recipe.
+
+Start the service with the veRL backend:
+
+```bash
+export VERL_CONFIG_DIR=/workspace/verl/verl/trainer/config
+export VERL_MINT_STORAGE_ROOT=/shared/path/verl-mint
+
+uv run --extra smoke --extra ray \
+  verl-mint serve \
+  --backend verl \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --storage-root "$VERL_MINT_STORAGE_ROOT" \
+  --model-path Qwen/Qwen3-0.6B \
+  --verl-config-dir "$VERL_CONFIG_DIR" \
+  --override data.train_files=/shared/path/data/train.parquet \
+  --override data.val_files=/shared/path/data/val.parquet \
+  --override trainer.total_training_steps=1
+```
+
+From any non-Ray host that can reach the service:
+
+```python
+import mint
+
+client = mint.ServiceClient(
+    base_url="http://<cluster-node-ip>:8000",
+    api_key="sk-local-smoke",
+)
+training = client.create_lora_training_client("Qwen/Qwen3-0.6B", rank=16)
+print(training.get_info())
+```
+
+Or run a packaged SDK client smoke against that service:
+
+```bash
+uv run --env-file /dev/null --extra client \
+  python scripts/client_verl_ppo_job_smoke.py \
+  --base-url http://<cluster-node-ip>:8000 \
+  --base-model Qwen/Qwen3-0.6B
 ```
 
 ## Ray cluster run
 
-`verl-mint` can move model execution into Ray actors while keeping the FastAPI process as the control plane. Start from an existing Ray 2.x cluster using `ray[default]>=2.46.0,<3` where the API node and workers share the same Python dependencies and artifact root.
+`verl-mint` can move model execution into Ray or veRL workers while keeping the FastAPI process as the control plane. Start from an existing Ray 2.x cluster using `ray[default]>=2.46.0,<3` where the API node and workers share the same Python dependencies and artifact root. For open-source use, the expected deployment shape is one service process on the Ray or veRL cluster plus clients on any network-reachable non-Ray host.
 
-```bash
-export VERL_MINT_STORAGE_ROOT=/shared/path/verl-mint
-export VERL_MINT_SHARED_STORAGE_ROOTS=/shared/path
-
-uv run --env-file .env env PYTHONPATH=$PYTHONPATH \
-  python scripts/official_client_verl_cluster_smoke.py \
-  --storage-root "$VERL_MINT_STORAGE_ROOT"
-```
+Use the service command above on the Ray or veRL cluster node, then run a `client_*` smoke from a network-reachable non-Ray host with `--base-url`. The `scripts/smoke_*.py` entries are local one-shot smoke servers; they are not the remote-client path.
 
 ## Architecture
 
-`verl-mint` runs a FastAPI control plane that accepts MinT-style training requests, routes them through backend abstractions, and stores checkpoint artifacts through a configurable storage repository. Local development can use the lightweight fake and Qwen SFT backends; distributed runs use Ray/veRL workers while keeping the API process responsible for sessions, futures, checkpoint metadata, and sampler handoff.
+`verl-mint` runs a FastAPI control plane that accepts MinT-style training requests, routes them through backend abstractions, and stores checkpoint artifacts through a configurable storage repository. Local diagnostics can use the lightweight fake and Qwen backends, but the recommended model-backed path uses veRL trainer execution while keeping the API process responsible for sessions, futures, checkpoint metadata, and sampler handoff.
 
 ## API surface
 
@@ -159,8 +197,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, test commands, pul
 ## Requirements
 
 - Python `>=3.11`
-- CUDA GPU for practical local model training
-- `torch`, `transformers`, `peft`, and `accelerate` for Qwen local training
+- CUDA GPU for practical model training
+- `torch`, `transformers`, `peft`, and `accelerate` for local diagnostics
 - `ray[default]>=2.46.0,<3` for distributed execution
 - shared storage for multi-node checkpoint save and load
 

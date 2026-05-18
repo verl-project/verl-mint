@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -145,7 +145,8 @@ class FutureRetrieveRequest(MintBaseSchema):
 
 
 class WeightsInfoRequest(MintBaseSchema):
-    mint_path: str
+    mint_path: str | None = None
+    tinker_path: str | None = None
 
 
 class CreateModelRequest(MintBaseSchema):
@@ -444,6 +445,7 @@ class ComputeLogprobsResponse(MintBaseSchema):
 class CreateSessionRequest(MintBaseSchema):
     tags: list[str] = Field(default_factory=list)
     user_metadata: dict[str, Any] = Field(default_factory=dict)
+    project_id: str | None = None
     sdk_version: str = ""
     type: Literal["create_session"] = "create_session"
 

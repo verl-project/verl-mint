@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+import re
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -99,6 +100,11 @@ def _parse_model_seq_id(model_id: str) -> int | None:
         return None
 
 
+def _artifact_path_segment(value: str) -> str:
+    segment = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return segment or "artifact"
+
+
 def _prompt_text(prompt: str | object) -> str:
     if isinstance(prompt, str):
         return prompt
@@ -118,7 +124,7 @@ def _prompt_text(prompt: str | object) -> str:
 
 
 def _tensor_data(value: float = 0.0) -> TensorData:
-    return TensorData(data=value, shape=[], dtype="float32")
+    return TensorData(data=[value], shape=[1], dtype="float32")
 
 
 def _json_safe(value):
@@ -232,6 +238,31 @@ def _fb_output_v1(result, *, loss_fn: str | None = None, forward_backward_input:
     }
 
 
+def _forward_backward_result(service: MintService, model_id: str, payload: dict, *, seq_id: int | None):
+    loss_fn = str(payload.get("loss_fn") or "").lower()
+    loss_fn_config = payload.get("loss_fn_config") or {}
+    if not isinstance(loss_fn_config, dict):
+        loss_fn_config = {}
+
+    if loss_fn == "ppo":
+        return service.training.forward_backward_ppo(
+            model_id,
+            batch_payload={**payload, **loss_fn_config, "algorithm": "ppo"},
+            options={**loss_fn_config, "seq_id": seq_id},
+        )
+    if loss_fn in {"grpo", "reverse_kl"}:
+        return service.training.forward_backward_reverse_kl(
+            model_id,
+            batch_payload={**payload, **loss_fn_config, "algorithm": "grpo"},
+            options={**loss_fn_config, "seq_id": seq_id},
+        )
+    return service.training.forward_backward(
+        model_id,
+        batch_payload=payload,
+        options={"seq_id": seq_id},
+    )
+
+
 def _select_backend_id(
     service: MintService,
     kind: BackendKind,
@@ -305,8 +336,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
             return str(requested_path)
         if versioned:
             checkpoint_id = requested_path or "checkpoint.pt"
-            return f"mint://{model_id}/weights/{checkpoint_id}"
-        return requested_path or f"mint://checkpoints/{model_id}.pt"
+            return f"mint://{_artifact_path_segment(model_id)}/weights/{checkpoint_id}"
+        return requested_path or f"mint://checkpoints/{_artifact_path_segment(model_id)}.pt"
 
     def _sampler_checkpoint_uri(model_id: str, requested_path: str | None, *, versioned: bool, sampling_session_seq_id: int | None = None) -> str:
         if _has_uri_scheme(requested_path):
@@ -314,8 +345,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
         if versioned:
             seq = sampling_session_seq_id if sampling_session_seq_id is not None else 1
             checkpoint_id = requested_path or f"sampler-{seq}.pt"
-            return f"mint://{model_id}/sampler_weights/{checkpoint_id}"
-        return requested_path or f"mint://sampler/{model_id}.pt"
+            return f"mint://{_artifact_path_segment(model_id)}/sampler_weights/{checkpoint_id}"
+        return requested_path or f"mint://sampler/{_artifact_path_segment(model_id)}.pt"
 
     def _sampling_session_id(session_id: str, seq_id: int) -> str:
         return f"{session_id}:sampler:{seq_id}"
@@ -426,7 +457,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
         aliases = {path}
         if not _has_uri_scheme(path):
             checkpoint_kind = "weights" if entry["checkpoint_type"] == "training" else "sampler_weights"
-            aliases.add(f"mint://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}")
+            aliases.add(f"mint://{_artifact_path_segment(model_id)}/{checkpoint_kind}/{entry['checkpoint_id']}")
         return aliases
 
     def _checkpoint_public_path(model_id: str, entry: dict, *, versioned: bool) -> str:
@@ -434,7 +465,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
         if not versioned or _has_uri_scheme(path):
             return path
         checkpoint_kind = "weights" if entry["checkpoint_type"] == "training" else "sampler_weights"
-        return f"mint://{model_id}/{checkpoint_kind}/{entry['checkpoint_id']}"
+        return f"mint://{_artifact_path_segment(model_id)}/{checkpoint_kind}/{entry['checkpoint_id']}"
 
     def _checkpoint_api_payload(entry: dict, path: str) -> dict:
         return {
@@ -891,11 +922,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/api/v1/forward_backward")
     def forward_backward_v1(body: ForwardBackwardRequest):
         payload = body.forward_backward_input.model_dump()
-        result = service.training.forward_backward(
-            body.model_id,
-            batch_payload=payload,
-            options={"seq_id": body.seq_id},
-        )
+        result = _forward_backward_result(service, body.model_id, payload, seq_id=body.seq_id)
         return _future(
             _fb_output_v1(
                 result,
@@ -934,11 +961,7 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/forward_backward")
     def forward_backward(body: ForwardBackwardRequest):
         payload = body.forward_backward_input.model_dump()
-        result = service.training.forward_backward(
-            body.model_id,
-            batch_payload=payload,
-            options={"seq_id": body.seq_id},
-        )
+        result = _forward_backward_result(service, body.model_id, payload, seq_id=body.seq_id)
         response = ForwardBackwardResponse(
             output=_fb_output(
                 result,
@@ -998,6 +1021,8 @@ def create_app(service: MintService | None = None) -> FastAPI:
         response = ForwardBackwardPPOResponse(outputs=outputs, metrics=metrics)
         return _future(response.model_dump())
 
+    @app.post("/api/v1/mint/forward_backward_reverse_kl")
+    @app.post("/mint/forward_backward_reverse_kl")
     @app.post("/api/v1/forward_backward_reverse_kl")
     @app.post("/forward_backward_reverse_kl")
     def forward_backward_reverse_kl(body: ForwardBackwardReverseKLRequest):
@@ -1101,9 +1126,12 @@ def create_app(service: MintService | None = None) -> FastAPI:
     @app.post("/api/v1/weights_info")
     @app.post("/weights_info")
     def weights_info(body: WeightsInfoRequest):
-        info = app.state.weights_info.get(body.mint_path)
+        path = body.mint_path or body.tinker_path
+        if not path:
+            raise HTTPException(status_code=422, detail="mint_path or tinker_path is required")
+        info = app.state.weights_info.get(path)
         if info is None:
-            raise HTTPException(status_code=404, detail=f"Checkpoint '{body.mint_path}' not found")
+            raise HTTPException(status_code=404, detail=f"Checkpoint '{path}' not found")
         return WeightsInfoResponse(**info)
 
     @app.post("/api/v1/retrieve_future")

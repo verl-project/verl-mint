@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import socket
 import tempfile
 import threading
@@ -9,12 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import mint
 import uvicorn
-from mint import types
 
 from verl_mint import create_app
 from verl_mint.backends.base import InferenceBackend, TrainingBackend
+from verl_mint.backends.qwen_sft import QwenSFTTrainingBackend, QwenTextInferenceBackend
 from verl_mint.contracts import (
     ArtifactRef,
     BackendKind,
@@ -31,15 +29,49 @@ from verl_mint.contracts import (
     TrainingCapabilities,
     TrainState,
 )
+from verl_mint.defaults import DEFAULT_BASE_MODEL_ID
 from verl_mint.service import MintService
 from verl_mint.storage import LocalStorageRepo
 
-SMOKE_CLIENT_TOKEN = "unused"
+
+class ServerThread(threading.Thread):
+    def __init__(self, *, app, host: str, port: int) -> None:
+        super().__init__(daemon=True)
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self.server = uvicorn.Server(config)
+
+    def run(self) -> None:
+        self.server.run()
+
+    def stop(self) -> None:
+        self.server.should_exit = True
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_port(host: str, port: int, timeout_s: float = 30.0) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            if sock.connect_ex((host, port)) == 0:
+                return
+        time.sleep(0.1)
+    raise TimeoutError(f"server did not start on {host}:{port} within {timeout_s}s")
 
 
 class FakeInferenceBackend(InferenceBackend):
     def generate(self, req: GenerateRequest) -> GenerateResult:
         return GenerateResult(text=req.prompt.upper(), raw={"provider": "fake-vllm"})
+
+
+class NoopInferenceBackend(InferenceBackend):
+    def generate(self, req: GenerateRequest) -> GenerateResult:
+        return GenerateResult(text=req.prompt, raw={"provider": "noop"})
 
 
 @dataclass
@@ -122,121 +154,116 @@ class FakeTrainingBackend(TrainingBackend):
         return self.checkpoint_root / parsed.scheme / rel
 
 
-class ServerThread(threading.Thread):
-    def __init__(self, *, host: str, port: int, storage_root: Path) -> None:
-        super().__init__(daemon=True)
-        service = MintService(storage=LocalStorageRepo(storage_root))
-        service.backends.register(
-            BackendSpec(
-                backend_id="vllm-http",
-                kind=BackendKind.INFERENCE,
-                provider="vllm",
-                model_family="qwen",
-            ),
-            FakeInferenceBackend(),
-        )
-        service.backends.register(
-            BackendSpec(
-                backend_id="megatron-http",
-                kind=BackendKind.TRAINING,
-                provider="megatron",
-                model_family="qwen",
-            ),
-            FakeTrainingBackend(),
-        )
-        app = create_app(service)
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        self.server = uvicorn.Server(config)
-
-    def run(self) -> None:
-        self.server.run()
-
-    def stop(self) -> None:
-        self.server.should_exit = True
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def wait_for_port(host: str, port: int, timeout_s: float = 10.0) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.2)
-            if sock.connect_ex((host, port)) == 0:
-                return
-        time.sleep(0.1)
-    raise TimeoutError(f"server did not start on {host}:{port} within {timeout_s}s")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0)
-    parser.add_argument(
-        "--storage-root",
-        default="/tmp/verl-mint-official-client-smoke",
+def fake_app(storage_root: Path):
+    service = MintService(storage=LocalStorageRepo(storage_root))
+    service.backends.register(
+        BackendSpec(
+            backend_id="vllm-http",
+            kind=BackendKind.INFERENCE,
+            provider="vllm",
+            model_family="qwen",
+        ),
+        FakeInferenceBackend(),
     )
-    args = parser.parse_args()
+    service.backends.register(
+        BackendSpec(
+            backend_id="megatron-http",
+            kind=BackendKind.TRAINING,
+            provider="megatron",
+            model_family="qwen",
+        ),
+        FakeTrainingBackend(),
+    )
+    return create_app(service)
 
-    port = args.port or find_free_port()
-    server = ServerThread(host=args.host, port=port, storage_root=Path(args.storage_root))
-    server.start()
 
-    try:
-        wait_for_port(args.host, port)
-        svc = mint.ServiceClient(base_url=f"http://{args.host}:{port}", api_key=SMOKE_CLIENT_TOKEN)
-        train = svc.create_lora_training_client(
-            base_model="Qwen/Qwen3-0.6B",
-            rank=16,
-            user_metadata={"smoke": "official-client"},
+def qwen_app(storage_root: Path, *, inference: bool = True):
+    service = MintService(storage=LocalStorageRepo(storage_root))
+    if inference:
+        service.backends.register(
+            BackendSpec(
+                backend_id="qwen-infer-local",
+                kind=BackendKind.INFERENCE,
+                provider="transformers",
+                model_family="qwen",
+            ),
+            QwenTextInferenceBackend(model_id=DEFAULT_BASE_MODEL_ID),
         )
-        info = train.get_info()
-        print("model_id", info.model_id)
-        print("model_name", info.model_name)
+    service.backends.register(
+        BackendSpec(
+            backend_id="qwen-sft-local",
+            kind=BackendKind.TRAINING,
+            provider="transformers-peft",
+            model_family="qwen",
+        ),
+        QwenSFTTrainingBackend(model_id=DEFAULT_BASE_MODEL_ID),
+    )
+    return create_app(service)
 
-        datum = types.Datum(
-            model_input=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[10, 11, 12])]),
-            loss_fn_inputs={
-                "target_tokens": types.TensorData(data=[11, 12, 13], dtype="int64", shape=[3]),
-                "loss_mask": types.TensorData(data=[1.0, 1.0, 1.0], dtype="float32", shape=[3]),
-            },
+
+def verl_app(
+    storage_root: Path,
+    *,
+    inference: bool = False,
+    model_id: str = DEFAULT_BASE_MODEL_ID,
+):
+    from verl_mint.backends.verl import VerlInferenceBackend, VerlTrainingBackend
+
+    service = MintService(storage=LocalStorageRepo(storage_root))
+    if inference:
+        service.backends.register(
+            BackendSpec(
+                backend_id="verl-infer",
+                kind=BackendKind.INFERENCE,
+                provider="verl",
+                model_family="qwen",
+            ),
+            VerlInferenceBackend(
+                backend_kwargs={"model_id": model_id},
+            ),
         )
-        fb = train.forward_backward([datum], loss_fn="cross_entropy").result()
-        print("fb_metrics", fb.metrics)
-
-        opt = train.optim_step(types.AdamParams(learning_rate=3e-4)).result()
-        print("opt_metrics", opt.metrics)
-
-        saved = train.save_state("checkpoint-001").result()
-        print("saved_path", saved.path)
-
-        loaded = train.load_state(saved.path).result()
-        print("loaded_path", loaded.path)
-
-        resumed = svc.create_training_client_from_state(saved.path)
-        print("resumed_model_id", resumed.get_info().model_id)
-
-        resumed_opt = svc.create_training_client_from_state_with_optimizer(saved.path)
-        print("resumed_opt_model_id", resumed_opt.get_info().model_id)
-
-        sampler_saved = train.save_weights_for_sampler("sampler-001").result()
-        print("sampler_saved_path", sampler_saved.path)
-
-        sampling_client = train.save_weights_and_get_sampling_client()
-        sample = sampling_client.sample(
-            prompt=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2, 3])]),
-            num_samples=1,
-            sampling_params=types.SamplingParams(max_tokens=2),
-        ).result()
-        print("sample_sequences", len(sample.sequences))
-    finally:
-        server.stop()
-        server.join(timeout=5)
+    service.backends.register(
+        BackendSpec(
+            backend_id="verl-train",
+            kind=BackendKind.TRAINING,
+            provider="verl",
+            model_family="qwen",
+        ),
+        VerlTrainingBackend(
+            backend_kwargs={"model_id": model_id},
+        ),
+    )
+    return create_app(service)
 
 
-if __name__ == "__main__":
-    main()
+def verl_ppo_app(
+    storage_root: Path,
+    *,
+    model_path: str,
+    trainer_config: dict,
+):
+    from verl_mint.backends.verl import VerlTrainingBackend
+
+    service = MintService(storage=LocalStorageRepo(storage_root))
+    service.backends.register(
+        BackendSpec(
+            backend_id="noop-infer",
+            kind=BackendKind.INFERENCE,
+            provider="noop",
+            model_family="qwen",
+        ),
+        NoopInferenceBackend(),
+    )
+    service.backends.register(
+        BackendSpec(
+            backend_id="verl-train",
+            kind=BackendKind.TRAINING,
+            provider="verl",
+            model_family="qwen",
+        ),
+        VerlTrainingBackend(
+            model_path=model_path,
+            backend_kwargs={"trainer": trainer_config},
+        ),
+    )
+    return create_app(service)

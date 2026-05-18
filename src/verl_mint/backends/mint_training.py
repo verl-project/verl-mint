@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from verl_mint.contracts import TrainOpRequest
 
 
-class MintStyleBatchError(ValueError):
+class MinTTrainingBatchError(ValueError):
     pass
 
 
@@ -18,13 +18,13 @@ def _as_list(value: Any, *, field: str) -> list[Any]:
         return list(value)
     if isinstance(value, list):
         return value
-    raise MintStyleBatchError(f"{field} must be a list, tuple, or {{'data': ...}}")
+    raise MinTTrainingBatchError(f"{field} must be a list, tuple, or {{'data': ...}}")
 
 
 def _as_float_list(value: Any, *, field: str, n: int) -> list[float]:
     xs = [float(x) for x in _as_list(value, field=field)]
     if len(xs) != n:
-        raise MintStyleBatchError(f"{field} length {len(xs)} != completion length {n}")
+        raise MinTTrainingBatchError(f"{field} length {len(xs)} != completion length {n}")
     return xs
 
 
@@ -36,11 +36,19 @@ def _extract_samples(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     samples = payload.get("samples")
     if isinstance(samples, (list, tuple)):
         if not samples:
-            raise MintStyleBatchError("samples must not be empty")
+            raise MinTTrainingBatchError("samples must not be empty")
         return [dict(s) for s in samples]
     if "prompt_tokens" not in payload or "completion_tokens" not in payload:
-        raise MintStyleBatchError("payload requires samples or prompt_tokens/completion_tokens")
+        raise MinTTrainingBatchError("payload requires samples or prompt_tokens/completion_tokens")
     return [dict(payload)]
+
+
+def is_mint_reverse_kl_payload(payload: Mapping[str, Any]) -> bool:
+    data = payload.get("data")
+    if not isinstance(data, (list, tuple)) or not data:
+        return False
+    first = data[0]
+    return isinstance(first, Mapping) and "student_input" in first and "target_tokens" in first
 
 
 def _group_centered_advantages(samples: list[dict[str, Any]]) -> dict[int, list[float]]:
@@ -63,11 +71,11 @@ def _group_centered_advantages(samples: list[dict[str, Any]]) -> dict[int, list[
     return out
 
 
-def build_mint_style_datum(sample: Mapping[str, Any], advantages: list[float] | None = None) -> dict[str, Any]:
+def build_mint_grpo_datum(sample: Mapping[str, Any], advantages: list[float] | None = None) -> dict[str, Any]:
     prompt = _as_int_list(sample.get("prompt_tokens", ()), field="prompt_tokens")
     completion = _as_int_list(sample.get("completion_tokens", ()), field="completion_tokens")
     if not completion:
-        raise MintStyleBatchError("completion_tokens must not be empty")
+        raise MinTTrainingBatchError("completion_tokens must not be empty")
     tokens = prompt + completion
     n = len(completion)
 
@@ -77,7 +85,7 @@ def build_mint_style_datum(sample: Mapping[str, Any], advantages: list[float] | 
         raw_adv = sample.get("advantages")
         advantages = _as_float_list(raw_adv, field="advantages", n=n) if raw_adv else [float(sample.get("reward", 0.0))] * n
     elif len(advantages) != n:
-        raise MintStyleBatchError(f"advantages length {len(advantages)} != completion length {n}")
+        raise MinTTrainingBatchError(f"advantages length {len(advantages)} != completion length {n}")
 
     return {
         "model_input": {"chunks": [{"tokens": tokens}]},
@@ -97,14 +105,61 @@ def build_mint_style_datum(sample: Mapping[str, Any], advantages: list[float] | 
     }
 
 
-def build_mint_style_grpo_datums(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+def build_mint_grpo_datums(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     samples = _extract_samples(payload)
     computed_advantages = _group_centered_advantages(samples)
-    return [build_mint_style_datum(sample, computed_advantages.get(i)) for i, sample in enumerate(samples)]
+    return [build_mint_grpo_datum(sample, computed_advantages.get(i)) for i, sample in enumerate(samples)]
+
+
+def build_mint_reverse_kl_datums(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    data = payload.get("data")
+    if not isinstance(data, (list, tuple)) or not data:
+        raise MinTTrainingBatchError("reverse-KL payload requires non-empty data")
+
+    datums: list[dict[str, Any]] = []
+    for i, raw in enumerate(data):
+        if not isinstance(raw, Mapping):
+            raise MinTTrainingBatchError(f"reverse-KL data[{i}] must be a mapping")
+        item = dict(raw)
+        student_input = item.get("student_input")
+        target_tokens = item.get("target_tokens")
+        weights = item.get("weights")
+        if not isinstance(student_input, Mapping):
+            raise MinTTrainingBatchError(f"reverse-KL data[{i}].student_input must be a mapping")
+        if target_tokens is None:
+            raise MinTTrainingBatchError(f"reverse-KL data[{i}].target_tokens is required")
+        if weights is None:
+            raise MinTTrainingBatchError(f"reverse-KL data[{i}].weights is required")
+
+        loss_fn_inputs = {
+            "target_tokens": target_tokens,
+            "weights": weights,
+            "reference_input": item.get("reference_input"),
+            "reference_logprobs": item.get("reference_logprobs"),
+            "temperature": payload.get("temperature"),
+            "reference_model_path": payload.get("reference_model_path"),
+        }
+        for key in ("old_logprobs", "old_values", "advantages", "returns"):
+            if item.get(key) is not None:
+                loss_fn_inputs[key] = item[key]
+
+        datums.append(
+            {
+                "model_input": dict(student_input),
+                "loss_fn_inputs": {k: v for k, v in loss_fn_inputs.items() if v is not None},
+                "metadata": {
+                    "algorithm": "reverse_kl",
+                    "sample_id": str(item.get("sample_id", "")),
+                    "group_id": str(item.get("group_id", "default")),
+                    "reference_model_path": str(payload.get("reference_model_path", "")),
+                },
+            }
+        )
+    return datums
 
 
 @dataclass
-class MintStyleGRPOTrainer:
+class MinTTrainingAdapter:
     trainer: Any
     adapter: Any | None = None
     max_token_len_per_gpu: int = 10240
@@ -114,18 +169,24 @@ class MintStyleGRPOTrainer:
 
     def step(self, req: TrainOpRequest) -> Mapping[str, Any]:
         if not isinstance(req.batch_payload, Mapping):
-            raise MintStyleBatchError("Mint-style GRPO batch_payload must be a mapping")
+            raise MinTTrainingBatchError("MinT training GRPO batch_payload must be a mapping")
         payload = dict(req.batch_payload)
-        datums = build_mint_style_grpo_datums(payload)
-        train_batch = self._to_train_batch(datums)
+        if is_mint_reverse_kl_payload(payload):
+            algorithm = "reverse_kl"
+            payload = {**payload, "temperature": req.options.get("temperature", payload.get("temperature"))}
+            datums = build_mint_reverse_kl_datums(payload)
+        else:
+            algorithm = "grpo"
+            datums = build_mint_grpo_datums(payload)
+        train_batch = self._to_train_batch(datums, algorithm=algorithm)
         out = self._forward_backward(train_batch, req)
         opt = self._optimizer_step(req)
         adapter = self._export_adapter(req)
         record = {"datums": datums, "forward_backward": out, "optimizer": opt, "adapter": adapter}
         self.history.append(record)
         return {
-            "algorithm": "grpo",
-            "execution_framework": "mint_style",
+            "algorithm": algorithm,
+            "execution_framework": "mint_training",
             "num_samples": len(datums),
             "num_tokens": sum(len(d["model_input"]["chunks"][0]["tokens"]) for d in datums),
             "forward_backward": out,
@@ -133,15 +194,12 @@ class MintStyleGRPOTrainer:
             "adapter": adapter,
         }
 
-    def _to_train_batch(self, datums: list[dict[str, Any]]) -> Any:
+    def _to_train_batch(self, datums: list[dict[str, Any]], *, algorithm: str = "grpo") -> Any:
         if self.adapter is None:
             return datums
         fn = getattr(self.adapter, "to_train_batch", None)
         if fn is not None:
             return fn(datums, max_token_len_per_gpu=self.max_token_len_per_gpu)
-        fn = getattr(self.adapter, "to_data_proto", None)
-        if fn is not None:
-            return fn({"tensors": {"mint_datums": datums}, "meta_info": {"algorithm": "grpo", "route": "mint_style"}})
         return datums
 
     def _forward_backward(self, train_batch: Any, req: TrainOpRequest) -> Any:
@@ -149,7 +207,7 @@ class MintStyleGRPOTrainer:
             fn = getattr(self.trainer, name, None)
             if fn is not None:
                 return fn(train_batch)
-        raise MintStyleBatchError(f"trainer {type(self.trainer).__name__} has no forward/backward method")
+        raise MinTTrainingBatchError(f"trainer {type(self.trainer).__name__} has no forward/backward method")
 
     def _optimizer_step(self, req: TrainOpRequest) -> Any:
         if req.options.get("skip_optimizer_step"):

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import importlib
+import json
+import os
+import sys
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 from verl_mint.backends.base import InferenceBackend, TrainingBackend
-from verl_mint.backends.mint_style import MintStyleGRPOTrainer
+from verl_mint.backends.mint_training import MinTTrainingAdapter, is_mint_reverse_kl_payload
 from verl_mint.contracts import (
     ArtifactRef,
     CheckpointRequest,
@@ -29,6 +34,7 @@ class VerlRuntimeError(RuntimeError):
 
 
 def _import_attr(module_name: str, attr_name: str) -> Any:
+    _prefer_torch_only_optional_imports()
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # pragma: no cover - depends on optional veRL install
@@ -60,6 +66,132 @@ _VERL_META_KEYS = {
     "verl_config_overrides",
     "verl_overrides",
 }
+
+_RUNTIME_ENV_ROOT_ENV = "VERL_MINT_RUNTIME_ENV_ROOT"
+_HF_MODULES_PATH_ENV = "VERL_MINT_HF_MODULES_PATH"
+_RUNTIME_ROOT_CONFIG_KEYS = ("runtime_env_root", "verl_mint_runtime_env_root")
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _runtime_pythonpath_entries(root: Path) -> list[str]:
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        runtime = manifest.get("runtime_env") if isinstance(manifest, Mapping) else {}
+        if not isinstance(runtime, Mapping):
+            runtime = {}
+        site_packages_dir = str(runtime.get("site_packages_dir") or "site-packages")
+        source_dir = str(runtime.get("source_dir") or "src")
+        entries = [str(root / site_packages_dir)]
+        for source in manifest.get("sources", []):
+            if not isinstance(source, Mapping) or source.get("host_only"):
+                continue
+            name = str(source.get("name") or "").strip()
+            if not name:
+                continue
+            for relative in source.get("pythonpath") or ["."]:
+                entries.append(str(root / source_dir / name / str(relative)))
+        return _dedupe_paths(entries)
+
+    return _dedupe_paths(
+        [
+            str(root / "site-packages"),
+            str(root / "src/Megatron-LM"),
+            str(root / "src/Megatron-Bridge/src"),
+            str(root / "src/Megatron-Bridge"),
+            str(root / "src/verl"),
+        ]
+    )
+
+
+def _runtime_env_root_from_config(config: Any) -> str | None:
+    for key in _RUNTIME_ROOT_CONFIG_KEYS:
+        value = _nested_get(config, key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = os.environ.get(_RUNTIME_ENV_ROOT_ENV)
+    if value and value.strip():
+        return value.strip()
+    return None
+
+
+def _runtime_env_from_root(root: str | None, *, base_env_vars: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if not root:
+        return {}
+    root_path = Path(root).expanduser().resolve()
+    env_vars = {str(k): str(v) for k, v in dict(base_env_vars or {}).items()}
+
+    runtime_paths = _runtime_pythonpath_entries(root_path)
+    hf_modules = env_vars.get(_HF_MODULES_PATH_ENV) or os.environ.get(_HF_MODULES_PATH_ENV)
+    if hf_modules:
+        runtime_paths.append(str(hf_modules))
+        env_vars[_HF_MODULES_PATH_ENV] = str(hf_modules)
+
+    existing_pythonpath = env_vars.get("PYTHONPATH") or os.environ.get("PYTHONPATH") or ""
+    pythonpath = _dedupe_paths([*runtime_paths, *str(existing_pythonpath).split(os.pathsep)])
+    env_vars["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    env_vars[_RUNTIME_ENV_ROOT_ENV] = str(root_path)
+
+    for name in ("HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "PYTHONDONTWRITEBYTECODE"):
+        value = env_vars.get(name) or os.environ.get(name)
+        if value is not None:
+            env_vars[name] = str(value)
+    env_vars.setdefault("USE_TF", "0")
+    env_vars.setdefault("TRANSFORMERS_NO_TF", "1")
+    env_vars.setdefault("USE_FLAX", "0")
+    return {"env_vars": env_vars}
+
+
+def _prefer_torch_only_optional_imports() -> None:
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+    os.environ.setdefault("USE_FLAX", "0")
+    sys.modules.setdefault("tensorboard.compat.notf", types.ModuleType("tensorboard.compat.notf"))
+
+
+def _apply_runtime_env_to_current_process(root: str | None) -> None:
+    if not root:
+        return
+    env = _runtime_env_from_root(root)
+    env_vars = env.get("env_vars") if isinstance(env, Mapping) else None
+    if not isinstance(env_vars, Mapping):
+        return
+    for name, value in env_vars.items():
+        os.environ[str(name)] = str(value)
+    for path in reversed(str(env_vars.get("PYTHONPATH") or "").split(os.pathsep)):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def _merge_ray_runtime_env(base: Mapping[str, Any] | None, overlay: Mapping[str, Any] | None) -> dict[str, Any]:
+    merged = dict(base or {})
+    overlay = dict(overlay or {})
+    base_env = {str(k): str(v) for k, v in dict(merged.get("env_vars") or {}).items()}
+    overlay_env = {str(k): str(v) for k, v in dict(overlay.pop("env_vars", {}) or {}).items()}
+    pythonpath = _dedupe_paths(
+        [
+            *overlay_env.pop("PYTHONPATH", "").split(os.pathsep),
+            *base_env.pop("PYTHONPATH", "").split(os.pathsep),
+        ]
+    )
+    env_vars = {**base_env, **overlay_env}
+    if pythonpath:
+        env_vars["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    merged.update(overlay)
+    if env_vars:
+        merged["env_vars"] = env_vars
+    return merged
 
 
 def _merge_mapping(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -140,7 +272,7 @@ def _mint_hydra_overrides(model_ref: str, cfg: ModelConfig) -> list[str]:
                 "actor_rollout_ref.actor.megatron.param_offload=True",
                 "actor_rollout_ref.actor.megatron.optimizer_offload=True",
                 "actor_rollout_ref.actor.megatron.grad_offload=True",
-                "actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True",
+                "+actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True",
                 "actor_rollout_ref.actor.checkpoint.save_contents=[model,optimizer,extra]",
                 "actor_rollout_ref.actor.checkpoint.load_contents=[model,optimizer,extra]",
                 "actor_rollout_ref.actor.megatron.use_mbridge=True",
@@ -164,7 +296,7 @@ def _mint_hydra_overrides(model_ref: str, cfg: ModelConfig) -> list[str]:
                 "critic.megatron.param_offload=True",
                 "critic.megatron.optimizer_offload=True",
                 "critic.megatron.grad_offload=True",
-                "critic.optim.override_optimizer_config.use_precision_aware_optimizer=True",
+                "+critic.optim.override_optimizer_config.use_precision_aware_optimizer=True",
                 "critic.checkpoint.save_contents=[model,optimizer,extra]",
                 "critic.checkpoint.load_contents=[model,optimizer,extra]",
                 f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg.inference_tp}",
@@ -175,12 +307,12 @@ def _mint_hydra_overrides(model_ref: str, cfg: ModelConfig) -> list[str]:
         if cfg.train_lora_rank is not None:
             values.extend(
                 [
-                    f"+actor_rollout_ref.model.lora.rank={cfg.train_lora_rank}",
-                    f"+actor_rollout_ref.model.lora.alpha={cfg.train_lora_alpha or cfg.train_lora_rank * 2}",
-                    "+actor_rollout_ref.model.lora.dtype=float16",
-                    "+actor_rollout_ref.model.lora.type=lora",
-                    "+actor_rollout_ref.model.lora.target_modules=[linear_qkv,linear_proj,linear_fc1,linear_fc2]",
-                    "+actor_rollout_ref.model.lora.exclude_modules=[]",
+                    f"actor_rollout_ref.model.lora.rank={cfg.train_lora_rank}",
+                    f"actor_rollout_ref.model.lora.alpha={cfg.train_lora_alpha or cfg.train_lora_rank * 2}",
+                    "actor_rollout_ref.model.lora.dtype=float16",
+                    "actor_rollout_ref.model.lora.type=lora",
+                    "actor_rollout_ref.model.lora.target_modules=[linear_qkv,linear_proj,linear_fc1,linear_fc2]",
+                    "actor_rollout_ref.model.lora.exclude_modules=[]",
                 ]
             )
         if cfg.gpu_memory_utilization is not None:
@@ -318,6 +450,7 @@ class VerlPPOJobRunner:
     ) -> None:
         self.config = dict(config or {})
         self._apply_mint_model_config()
+        _apply_runtime_env_to_current_process(_runtime_env_root_from_config(self.config))
         self.run_ppo = None if self.config.get("remote_run_ppo") else run_ppo or self._resolve_run_ppo(self.config)
         self.initialized = False
         self.closed = False
@@ -362,15 +495,27 @@ class VerlPPOJobRunner:
                 ray_init_kwargs = dict(ray_init)
             else:
                 ray_init_kwargs = OmegaConf.to_container(ray_init, resolve=True)
+            runtime_env = self._runtime_env_config(config)
+            if runtime_env:
+                ray_init_kwargs["runtime_env"] = _merge_ray_runtime_env(
+                    ray_init_kwargs.get("runtime_env"),
+                    runtime_env,
+                )
             ray.init(**ray_init_kwargs)
 
         run_ppo_path = str(self.config.get("run_ppo") or "verl.trainer.main_ppo:run_ppo")
 
-        @ray.remote(num_cpus=1)
+        remote_kwargs: dict[str, Any] = {"num_cpus": 1}
+        runtime_env = self._runtime_env_config(config)
+        if runtime_env:
+            remote_kwargs["runtime_env"] = runtime_env
+
+        @ray.remote(**remote_kwargs)
         def _remote_run_ppo(spec: Any, path: str) -> Any:
             import importlib
             from collections.abc import Mapping as RemoteMapping
 
+            _prefer_torch_only_optional_imports()
             if isinstance(spec, RemoteMapping):
                 hydra_spec = spec.get("hydra")
                 if isinstance(hydra_spec, RemoteMapping):
@@ -389,6 +534,18 @@ class VerlPPOJobRunner:
             return getattr(importlib.import_module(module_name), attr_name)(spec)
 
         return ray.get(_remote_run_ppo.remote(config, run_ppo_path))
+
+    @staticmethod
+    def _runtime_env_config(config: Any) -> dict[str, Any]:
+        base = _nested_get(config, "ray_runtime_env") or _nested_get(config, "runtime_env")
+        if base is not None and not isinstance(base, Mapping):
+            raise VerlRuntimeError("veRL ray runtime_env must be a mapping")
+        root = _runtime_env_root_from_config(config)
+        overlay = _runtime_env_from_root(
+            root,
+            base_env_vars=dict(base.get("env_vars") or {}) if isinstance(base, Mapping) else None,
+        )
+        return _merge_ray_runtime_env(base, overlay) if base or overlay else {}
 
     @staticmethod
     def _resolve_run_ppo(config: Mapping[str, Any]) -> Callable[[Any], Any]:
@@ -433,11 +590,16 @@ class VerlPPOJobRunner:
                 overrides,
                 (
                     "actor_rollout_ref.actor.fsdp_config",
+                    "actor_rollout_ref.model.lora_alpha",
+                    "actor_rollout_ref.model.lora_rank",
+                    "actor_rollout_ref.model.target_modules",
                     "actor_rollout_ref.ref.fsdp_config",
+                    "critic.model.enable_gradient_checkpointing",
                     "critic.fsdp_config",
                 ),
             )
-            hydra.setdefault("config_name", "ppo_megatron_trainer")
+            if hydra.get("config_name") in {None, "ppo_trainer"}:
+                hydra["config_name"] = "ppo_megatron_trainer"
         overrides = _merge_hydra_overrides(
             overrides,
             _mint_hydra_overrides(model_ref, cfg),
@@ -614,8 +776,8 @@ class VerlTrainingBackend(TrainingBackend):
         return self._result(handle, out, increment=True)
 
     def forward_backward_reverse_kl(self, handle: SessionHandle, req: TrainOpRequest) -> TrainOpResult:
-        if self._uses_mint_style_grpo(req):
-            out = MintStyleGRPOTrainer(
+        if self._uses_mint_training_adapter(req):
+            out = MinTTrainingAdapter(
                 self._trainer(handle),
                 adapter=self.batch_adapter,
                 max_token_len_per_gpu=int(req.options.get("max_token_len_per_gpu", 10240)),
@@ -625,13 +787,21 @@ class VerlTrainingBackend(TrainingBackend):
         out = _call_first(self._trainer(handle), ("grpo_step", "train_step", "fit_batch", "step", "update_actor"), data)
         return self._result(handle, out, increment=True)
 
-    def _uses_mint_style_grpo(self, req: TrainOpRequest) -> bool:
+    def _uses_mint_training_adapter(self, req: TrainOpRequest) -> bool:
         route = str(req.options.get("route") or req.options.get("execution_framework") or "").lower()
-        if route in {"mint_style", "mint-style", "mint"}:
+        if route in {"mint_training", "mint-training", "mint"}:
             return True
         if isinstance(req.batch_payload, Mapping):
             algo = str(req.batch_payload.get("algorithm") or req.options.get("algo") or "").lower()
-            return algo == "grpo" and bool(req.batch_payload.get("samples"))
+            if algo == "grpo" and bool(req.batch_payload.get("samples")):
+                return True
+            payload_type = str(req.batch_payload.get("type") or "").lower()
+            if payload_type == "mint_forward_backward_reverse_kl":
+                return True
+            if algo in {"grpo", "reverse_kl"} and is_mint_reverse_kl_payload(req.batch_payload):
+                return True
+            if req.batch_payload.get("reference_model_path") and is_mint_reverse_kl_payload(req.batch_payload):
+                return True
         return False
 
     def _run_dpo_loss(self, handle: SessionHandle, req: TrainOpRequest) -> TrainOpResult:

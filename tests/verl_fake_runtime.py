@@ -46,7 +46,7 @@ class FakeTrainer:
 
     def forward_backward_ppo(self, batch) -> Mapping[str, Any]:
         self.last_batch = batch
-        return {"loss": 0.03125, "op": "mint_style_forward_backward"}
+        return {"loss": 0.03125, "op": "mint_training_forward_backward"}
 
     def optimizer_step(self) -> Mapping[str, Any]:
         self.step += 1

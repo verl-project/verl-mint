@@ -27,7 +27,7 @@ uv pip install --default-index https://pypi.tuna.tsinghua.edu.cn/simple --torch-
   "accelerate>=0.33,<2"
 ```
 
-Install the MinT SDK when you need to run the official-client smoke scripts:
+Install the MinT SDK when you need to run the client smoke scripts:
 
 ```bash
 uv pip install "git+https://github.com/MindLab-Research/mindlab-toolkit.git"
@@ -38,13 +38,6 @@ The same temporary mirror flag can be used for SDK dependency downloads:
 ```bash
 uv pip install --default-index https://pypi.tuna.tsinghua.edu.cn/simple \
   "git+https://github.com/MindLab-Research/mindlab-toolkit.git"
-```
-
-For a local SDK checkout:
-
-```bash
-export MINT_SDK_PATH=/path/to/mindlab-toolkit/src
-export PYTHONPATH=$MINT_SDK_PATH:src
 ```
 
 ## Tests
@@ -58,8 +51,8 @@ uv run --env-file /dev/null pytest -q
 For model-backed or cluster changes, also run the smallest relevant smoke script and include the command in the PR description:
 
 ```bash
-uv run --env-file /dev/null env PYTHONPATH=$PYTHONPATH \
-  python scripts/official_client_fake_backend_smoke.py
+uv run --env-file /dev/null --extra smoke \
+  python scripts/smoke_fake_backend.py
 ```
 
 Qwen, veRL, and Ray paths may require GPU access, shared storage, or a configured cluster. Keep those checks separate from CPU-only unit tests. Cluster smoke scripts assume an existing Ray 2.x environment using `ray[default]>=2.46.0,<3` with matching versions on the API node and workers. The veRL backend intentionally does not expose a `verl` package extra because worker images and GPU dependencies are environment-specific.
@@ -80,7 +73,7 @@ Prefer Conventional Commit-style titles, such as `feat: add sampler checkpoint m
 
 The project follows PEP 440-compatible semantic versioning while it is in the `0.x` series:
 
-- patch releases, such as `0.1.1`, are for bug fixes and documentation-only changes
+- patch releases, such as `0.1.2`, are for bug fixes and documentation-only changes
 - minor releases, such as `0.2.0`, are for new features or breaking alpha API changes
 - release tags use the `vX.Y.Z` format and should match `project.version` in `pyproject.toml`
 
